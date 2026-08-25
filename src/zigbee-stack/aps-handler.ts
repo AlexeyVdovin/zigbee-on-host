@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { logger } from "../utils/logger.js";
 import {
     decodeMACCapabilities,
@@ -8,7 +9,7 @@ import {
     type MACHeader,
     ZigbeeMACConsts,
 } from "../zigbee/mac.js";
-import { ZigbeeConsts, ZigbeeKeyType, type ZigbeeSecurityHeader, ZigbeeSecurityLevel } from "../zigbee/zigbee.js";
+import { makeKeyedHash, ZigbeeConsts, ZigbeeKeyType, type ZigbeeSecurityHeader, ZigbeeSecurityLevel } from "../zigbee/zigbee.js";
 import {
     encodeZigbeeAPSFrame,
     ZigbeeAPSCommandId,
@@ -182,6 +183,57 @@ export class APSHandler {
      * - ⚠️  Derived key currently mirrors TC key; unique per-pair derivation still TODO
      * DEVICE SCOPE: Trust Center
      */
+    /**
+     * 05-3474-23 #4.6.3.6 & BDB #10.2 (Trust Center link key update)
+     *
+     * Get or generate the link key this Trust Center shares with one device.
+     *
+     * The key must be **unique per device**. Answering a key request with the
+     * well-known global key hands the requester a key every device on the
+     * network already has, and a Zigbee 3.0 joiner treats that as a failed key
+     * update: it decrypts the transport, acknowledges it, and leaves. From
+     * outside that is indistinguishable from a device that cannot join at all.
+     *
+     * SPEC COMPLIANCE NOTES:
+     * - Generates cryptographically random key material, unique per device
+     * - Reuses the stored key so a repeated request is idempotent
+     * - Persists via StackContext, so the key survives a restart
+     * DEVICE SCOPE: Trust Center
+     */
+    #getOrGenerateTCLinkKey(device64: bigint): Buffer {
+        const existing = this.#context.getAppLinkKey(device64, this.#context.netParams.eui64);
+
+        if (existing !== undefined) {
+            return existing;
+        }
+
+        const key = randomBytes(ZigbeeAPSConsts.CMD_KEY_LENGTH);
+
+        this.#context.setAppLinkKey(device64, this.#context.netParams.eui64, key);
+
+        return key;
+    }
+
+    /**
+     * 05-3474-23 #4.4.11.7 (Verify Key)
+     *
+     * The hash a device is expected to present to prove it holds the right
+     * Trust Center link key.
+     *
+     * A device that has been issued its own key proves *that* key, so the
+     * global `tcVerifyKeyHash` is the wrong thing to compare against and would
+     * answer a correct proof with SECURITY_FAILURE. Devices that never
+     * requested a key still hold the well-known one, so that remains the
+     * fallback.
+     *
+     * DEVICE SCOPE: Trust Center
+     */
+    #tcVerifyKeyHashFor(device64: bigint): Buffer {
+        const deviceKey = this.#context.getAppLinkKey(device64, this.#context.netParams.eui64);
+
+        return deviceKey === undefined ? this.#context.tcVerifyKeyHash : makeKeyedHash(deviceKey, 0x03);
+    }
+
     #getOrGenerateAppLinkKey(deviceA: bigint, deviceB: bigint): Buffer {
         const existing = this.#context.getAppLinkKey(deviceA, deviceB);
 
@@ -1991,7 +2043,11 @@ export class APSHandler {
                 );
 
                 if (this.#context.trustCenterPolicies.allowTCKeyRequest === TrustCenterKeyRequestPolicy.ALLOWED) {
-                    await this.sendTransportKeyTC(nwkHeader.source16!, this.#context.netParams.tcKey, requester64);
+                    const key = this.#context.trustCenterPolicies.issueUniqueTCLinkKeys
+                        ? this.#getOrGenerateTCLinkKey(requester64)
+                        : this.#context.netParams.tcKey;
+
+                    await this.sendTransportKeyTC(nwkHeader.source16!, key, requester64);
                 }
                 // TODO TrustCenterKeyRequestPolicy.ONLY_PROVISIONAL
                 //      this.apsDeviceKeyPairSet => find deviceAddress === this.context.deviceTable.get(nwkHeader.source).address64 => check provisional or drop msg
@@ -2222,7 +2278,10 @@ export class APSHandler {
 
             if (keyType === ZigbeeAPSConsts.CMD_KEY_TC_LINK) {
                 // TODO: not valid if operating in distributed network
-                const status = this.#context.tcVerifyKeyHash.equals(keyHash) ? 0x00 /* SUCCESS */ : 0xad; /* SECURITY_FAILURE */
+                // Take the device from the NWK header, not the payload's claimed
+                // source, so a device cannot be verified against another's key.
+                const verifier64 = nwkHeader.source64 ?? this.#context.address16ToAddress64.get(nwkHeader.source16!) ?? source;
+                const status = this.#tcVerifyKeyHashFor(verifier64).equals(keyHash) ? 0x00 /* SUCCESS */ : 0xad; /* SECURITY_FAILURE */
 
                 await this.sendConfirmKey(nwkHeader.source16!, status, keyType, source);
             } else if (keyType === ZigbeeAPSConsts.CMD_KEY_APP_MASTER) {

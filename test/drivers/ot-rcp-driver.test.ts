@@ -32,12 +32,13 @@ import {
     type MACHeader,
     ZigbeeMACConsts,
 } from "../../src/zigbee/mac.js";
-import { ZigbeeConsts } from "../../src/zigbee/zigbee.js";
+import { makeKeyedHash, ZigbeeConsts } from "../../src/zigbee/zigbee.js";
 import {
     decodeZigbeeAPSFrameControl,
     decodeZigbeeAPSHeader,
     decodeZigbeeAPSPayload,
     ZigbeeAPSCommandId,
+    ZigbeeAPSConsts,
     ZigbeeAPSDeliveryMode,
     ZigbeeAPSFrameType,
     type ZigbeeAPSHeader,
@@ -102,6 +103,7 @@ import {
     NETDEF_ZGP_COMMISSIONING,
     NETDEF_ZGP_FRAME_BCAST_RECALL_SCENE_0,
 } from "../data.js";
+import { createMACFrameControl } from "../utils.js";
 
 const randomBigInt = (): bigint => BigInt(`0x${randomBytes(8).toString("hex")}`);
 
@@ -2184,6 +2186,122 @@ describe("OT RCP Driver", () => {
                 endDeviceTimeout: undefined,
                 linkStatusMisses: 0,
             });
+        });
+
+        /**
+         * The recorded flow above replays a device that was given the global key, so its
+         * captured VERIFY_KEY carries a hash of that key and cannot be re-derived for a
+         * freshly generated one. This runs the same join with `issueUniqueTCLinkKeys` on,
+         * replaying the recording as far as REQUEST_KEY and then proving the key the Trust
+         * Center actually issued, which is the half the fixture cannot cover.
+         */
+        it("performs a join & authorize with a unique TC link key - ROUTER", async () => {
+            const device64 = 11871832136131022815n;
+            const device16 = 0xa18f;
+
+            vi.spyOn(driver.nwkHandler, "sendPeriodicManyToOneRouteRequest").mockImplementation(async () => {});
+            driver.context.allowJoins(0xfe, true);
+            driver.context.trustCenterPolicies.issueUniqueTCLinkKeys = true;
+
+            vi.spyOn(driver.context, "savePeriodicState").mockResolvedValue();
+            vi.spyOn(driver.context, "assignNetworkAddress").mockReturnValueOnce(device16);
+
+            driver.parser._transform(makeSpinelStreamRaw(1, NET2_BEACON_REQ_FROM_DEVICE), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelStreamRaw(1, NET2_ASSOC_REQ_FROM_DEVICE), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelStreamRaw(1, NET2_DATA_RQ_FROM_DEVICE), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup + 1), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup + 2), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelStreamRaw(1, NET2_DEVICE_ANNOUNCE_BCAST, Buffer.from([0xd8, 0xff, 0x00, 0x00])), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelStreamRaw(1, NET2_NODE_DESC_REQ_FROM_DEVICE, Buffer.from([0xce, 0xff, 0x00, 0x00])), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup + 3), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup + 4), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+
+            // The recorded REQUEST_KEY still decodes: the device has no key of its own yet,
+            // so it is secured with the well-known one, same as in the recording.
+            driver.parser._transform(
+                makeSpinelStreamRaw(1, NET2_REQUEST_KEY_TC_FROM_DEVICE, Buffer.from([0xd3, 0xff, 0x00, 0x00])),
+                "utf8",
+                () => {},
+            );
+            await vi.advanceTimersByTimeAsync(10);
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup + 5), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+
+            const issued = driver.context.getAppLinkKey(device64, driver.context.netParams.eui64);
+
+            expect(issued).not.toBeUndefined();
+            expect(issued!.equals(driver.context.netParams.tcKey)).toStrictEqual(false);
+            expect(driver.context.deviceTable.get(device64)!.authorized).toStrictEqual(false);
+
+            // The recording's VERIFY_KEY proves the global key, so it cannot be replayed here.
+            const verifyPayload = Buffer.alloc(1 + 1 + 8 + ZigbeeAPSConsts.CMD_KEY_LENGTH);
+            verifyPayload.writeUInt8(ZigbeeAPSCommandId.VERIFY_KEY, 0);
+            verifyPayload.writeUInt8(ZigbeeAPSConsts.CMD_KEY_TC_LINK, 1);
+            verifyPayload.writeBigUInt64LE(device64, 2);
+            makeKeyedHash(issued!, 0x03).copy(verifyPayload, 10);
+
+            // Not awaited yet: sending CONFIRM_KEY blocks on its own spinel ack below.
+            const verifying = driver.apsHandler.processCommand(
+                verifyPayload,
+                {
+                    frameControl: createMACFrameControl(MACFrameType.DATA, MACFrameAddressMode.SHORT, MACFrameAddressMode.SHORT),
+                    sequenceNumber: 0x84,
+                    destinationPANId: driver.context.netParams.panId,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: device16,
+                    source64: device64,
+                    commandId: undefined,
+                    fcs: 0,
+                },
+                {
+                    frameControl: {
+                        frameType: ZigbeeNWKFrameType.DATA,
+                        protocolVersion: ZigbeeNWKConsts.VERSION_2007,
+                        discoverRoute: ZigbeeNWKRouteDiscovery.SUPPRESS,
+                        multicast: false,
+                        security: true,
+                        sourceRoute: false,
+                        extendedDestination: false,
+                        extendedSource: true,
+                        endDeviceInitiator: false,
+                    },
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: device16,
+                    source64: device64,
+                    radius: 30,
+                    seqNum: 0x1f,
+                },
+                {
+                    frameControl: {
+                        frameType: ZigbeeAPSFrameType.CMD,
+                        deliveryMode: ZigbeeAPSDeliveryMode.UNICAST,
+                        ackFormat: false,
+                        security: true,
+                        ackRequest: true,
+                        extendedHeader: false,
+                    },
+                    counter: 0x0d,
+                },
+            );
+            await vi.advanceTimersByTimeAsync(10);
+            // CONFIRM_KEY => OK
+            driver.parser._transform(makeSpinelLastStatus(nextTidFromStartup + 6), "utf8", () => {});
+            await vi.advanceTimersByTimeAsync(10);
+            await verifying;
+
+            expect(driver.context.deviceTable.get(device64)!.authorized).toStrictEqual(true);
+            expect(mockCallbacks.onDeviceAuthorized).toHaveBeenCalledWith(device16, device64);
         });
 
         // it("performs a join & authorize - END DEVICE", async () => {
