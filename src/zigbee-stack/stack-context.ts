@@ -401,7 +401,8 @@ export class StackContext {
         allowJoins: false,
         installCode: InstallCodePolicy.NOT_REQUIRED,
         allowRejoinsWithWellKnownKey: true,
-        issueUniqueTCLinkKeys: false,
+        // bench-only: on for the zb-gw rig, so our ESP32-H2 nodes can complete a key exchange. Never in the upstream PR.
+        issueUniqueTCLinkKeys: true,
         allowTCKeyRequest: TrustCenterKeyRequestPolicy.ALLOWED,
         networkKeyUpdatePeriod: 0, // disable
         networkKeyUpdateMethod: NetworkKeyUpdateMethod.BROADCAST,
