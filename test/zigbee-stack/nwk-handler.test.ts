@@ -1545,6 +1545,41 @@ describe("NWK Handler", () => {
         sendRouteReplySpy.mockRestore();
     });
 
+    it("unicasts the route reply back to the neighbour that broadcast the request", async () => {
+        const sendRouteReplySpy = vi.spyOn(nwkHandler, "sendRouteReply").mockResolvedValue(true);
+        const firstHop16 = 0x8e8d;
+        const payload = Buffer.alloc(1 + 1 + 1 + 2 + 1);
+        let offset = 0;
+        offset = payload.writeUInt8(ZigbeeNWKCommandId.ROUTE_REQ, offset);
+        offset = payload.writeUInt8(0, offset);
+        offset = payload.writeUInt8(0x99, offset);
+        offset = payload.writeUInt16LE(ZigbeeConsts.COORDINATOR_ADDRESS, offset);
+        payload.writeUInt8(0x00, offset);
+
+        await nwkHandler.processCommand(
+            payload,
+            {
+                frameControl: {},
+                // a route request is broadcast, so this is never the originator's address
+                destination16: ZigbeeConsts.BCAST_DEFAULT,
+                source16: firstHop16,
+                sequenceNumber: 42,
+            } as MACHeader,
+            {
+                frameControl: {},
+                source16: firstHop16,
+                source64: 0x00124b0011223344n,
+                destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                radius: 30,
+                seqNum: 43,
+            } as ZigbeeNWKHeader,
+        );
+
+        expect(sendRouteReplySpy).toHaveBeenCalledOnce();
+        expect(sendRouteReplySpy.mock.calls[0][0]).toStrictEqual(firstHop16);
+        sendRouteReplySpy.mockRestore();
+    });
+
     it("purges relay references while retaining alternate routes", async () => {
         vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
 
