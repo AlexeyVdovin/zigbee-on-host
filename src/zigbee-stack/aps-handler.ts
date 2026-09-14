@@ -234,6 +234,26 @@ export class APSHandler {
         return deviceKey === undefined ? this.#context.tcVerifyKeyHash : makeKeyedHash(deviceKey, 0x03);
     }
 
+    /**
+     * 05-3474-23 #4.4.11.8 (Confirm Key)
+     *
+     * The link key a CONFIRM_KEY must be encrypted with: the one whose
+     * verification is being confirmed, not the global Trust Center key.
+     *
+     * A device that has been issued its own key decrypts the confirmation with
+     * that key. Sealing it with the global key instead leaves a joiner that
+     * enforces #4.4.11.8 unable to read it: it re-sends VERIFY_KEY until its key
+     * establishment times out, then leaves the network -- having already joined
+     * and been authorized, which makes the failure look like anything but a key
+     * problem. Devices that never requested a key still hold the well-known one,
+     * and `undefined` selects exactly that downstream.
+     *
+     * DEVICE SCOPE: Trust Center
+     */
+    #tcLinkKeyFor(device64: bigint): Buffer | undefined {
+        return this.#context.getAppLinkKey(device64, this.#context.netParams.eui64);
+    }
+
     #getOrGenerateAppLinkKey(deviceA: bigint, deviceB: bigint): Buffer {
         const existing = this.#context.getAppLinkKey(deviceA, deviceB);
 
@@ -1217,6 +1237,7 @@ export class APSHandler {
         apsDeliveryMode: ZigbeeAPSDeliveryMode.UNICAST | ZigbeeAPSDeliveryMode.BCAST,
         apsSecurityHeader: ZigbeeSecurityHeader | undefined,
         disableACKRequest = false,
+        apsEncryptKey?: Buffer,
     ): Promise<boolean> {
         let nwkSecurityHeader: ZigbeeSecurityHeader | undefined;
 
@@ -1288,7 +1309,7 @@ export class APSHandler {
             },
             finalPayload,
             apsSecurityHeader,
-            undefined, // use pre-hashed this.context.netParams.tcKey,
+            apsEncryptKey, // undefined => pre-hashed this.context.netParams.tcKey
         );
         const nwkFrame = encodeZigbeeNWKFrame(
             {
@@ -2276,19 +2297,22 @@ export class APSHandler {
                 NS,
             );
 
+            // Take the device from the NWK header, not the payload's claimed
+            // source, so a device cannot be verified against another's key --
+            // and so the confirmation is sealed with that same device's key.
+            const verifier64 = nwkHeader.source64 ?? this.#context.address16ToAddress64.get(nwkHeader.source16!) ?? source;
+            const confirmKey = this.#tcLinkKeyFor(verifier64);
+
             if (keyType === ZigbeeAPSConsts.CMD_KEY_TC_LINK) {
                 // TODO: not valid if operating in distributed network
-                // Take the device from the NWK header, not the payload's claimed
-                // source, so a device cannot be verified against another's key.
-                const verifier64 = nwkHeader.source64 ?? this.#context.address16ToAddress64.get(nwkHeader.source16!) ?? source;
                 const status = this.#tcVerifyKeyHashFor(verifier64).equals(keyHash) ? 0x00 /* SUCCESS */ : 0xad; /* SECURITY_FAILURE */
 
-                await this.sendConfirmKey(nwkHeader.source16!, status, keyType, source);
+                await this.sendConfirmKey(nwkHeader.source16!, status, keyType, source, confirmKey);
             } else if (keyType === ZigbeeAPSConsts.CMD_KEY_APP_MASTER) {
                 // this is illegal for TC
-                await this.sendConfirmKey(nwkHeader.source16!, 0xa3 /* ILLEGAL_REQUEST */, keyType, source);
+                await this.sendConfirmKey(nwkHeader.source16!, 0xa3 /* ILLEGAL_REQUEST */, keyType, source, confirmKey);
             } else {
-                await this.sendConfirmKey(nwkHeader.source16!, 0xaa /* NOT_SUPPORTED */, keyType, source);
+                await this.sendConfirmKey(nwkHeader.source16!, 0xaa /* NOT_SUPPORTED */, keyType, source, confirmKey);
                 // TODO: APP link key should also sync counters
             }
         }
@@ -2390,7 +2414,7 @@ export class APSHandler {
      * @param destination64 SHALL be the 64-bit extended address of the source device of the Verify-Key message
      * @returns
      */
-    public async sendConfirmKey(nwkDest16: number, status: number, keyType: number, destination64: bigint): Promise<boolean> {
+    public async sendConfirmKey(nwkDest16: number, status: number, keyType: number, destination64: bigint, encryptKey?: Buffer): Promise<boolean> {
         logger.debug(() => `===> APS CONFIRM_KEY[status=${status} type=${keyType} dst64=${destination64}]`, NS);
 
         const finalPayload = Buffer.alloc(11);
@@ -2420,6 +2444,8 @@ export class APSHandler {
                 // keySeqNum: undefined, only for keyId NWK
                 micLen: 4,
             }, // apsSecurityHeader
+            false, // disableACKRequest
+            encryptKey, // the link key being verified, per #4.4.11.8
         );
 
         const device = this.#context.deviceTable.get(destination64);

@@ -1495,19 +1495,41 @@ describe("Zigbee 3.0 Security Compliance", () => {
             await apsHandler.processCommand(payload, macHeader, nwkHeader, apsHeader);
 
             expect(frames).toHaveLength(1);
-            const confirm = decodeCommandFrame(frames[0]!);
-            expect(confirm.apsPayload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.CONFIRM_KEY);
+            const frame = frames[0]!;
+            // Decode with the key the device itself would use: its own, once it has
+            // been issued one, and the global key otherwise. Decoding with the global
+            // key unconditionally is what let a wrongly-sealed CONFIRM_KEY pass.
+            const confirmPayload = decodeAPSPayloadWithKey(frame, context.getAppLinkKey(device64, context.netParams.eui64));
+            expect(confirmPayload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.CONFIRM_KEY);
 
             mockMACHandlerCallbacks.onSendFrame = vi.fn();
 
-            return confirm.apsPayload.readUInt8(1);
+            return { status: confirmPayload.readUInt8(1), frame };
+        }
+
+        /**
+         * Decode a captured command frame's APS payload with an explicit link
+         * key, rather than the pre-hashed global one `decodeCommandFrame` uses.
+         * Without this a CONFIRM_KEY sealed with the wrong key still round-trips
+         * in a test, because encoder and decoder agree on the same wrong key.
+         */
+        function decodeAPSPayloadWithKey(frame: Buffer, key: Buffer | undefined) {
+            const macFrame = decodeMACFramePayload(frame);
+            const macPayload = macFrame.buffer.subarray(macFrame.payloadOffset, macFrame.buffer.length - 2);
+            const [nwkFrameControl, nwkOffset] = decodeZigbeeNWKFrameControl(macPayload, 0);
+            const [nwkHeader, payloadOffset] = decodeZigbeeNWKHeader(macPayload, nwkOffset, nwkFrameControl);
+            const nwkPayload = decodeZigbeeNWKPayload(macPayload, payloadOffset, undefined, context.netParams.eui64, nwkFrameControl, nwkHeader);
+            const [apsFrameControl, apsOffset] = decodeZigbeeAPSFrameControl(nwkPayload, 0);
+            const [apsHeader, apsPayloadOffset] = decodeZigbeeAPSHeader(nwkPayload, apsOffset, apsFrameControl);
+
+            return decodeZigbeeAPSPayload(nwkPayload, apsPayloadOffset, key, context.netParams.eui64, apsFrameControl, apsHeader);
         }
 
         it("confirms a device that proves the key it was actually issued", async () => {
             const device16 = 0x6806;
             const device64 = 0x00124b00bb660056n;
             const issued = await requestTCLinkKey(device16, device64);
-            const status = await verifyTCLinkKey(device16, device64, makeKeyedHash(issued, 0x03));
+            const { status } = await verifyTCLinkKey(device16, device64, makeKeyedHash(issued, 0x03));
 
             expect(status).toStrictEqual(0x00);
         });
@@ -1516,7 +1538,7 @@ describe("Zigbee 3.0 Security Compliance", () => {
             const device16 = 0x6807;
             const device64 = 0x00124b00bb660057n;
             await requestTCLinkKey(device16, device64);
-            const status = await verifyTCLinkKey(device16, device64, context.tcVerifyKeyHash);
+            const { status } = await verifyTCLinkKey(device16, device64, context.tcVerifyKeyHash);
 
             expect(status).toStrictEqual(0xad);
         });
@@ -1525,9 +1547,43 @@ describe("Zigbee 3.0 Security Compliance", () => {
             const device16 = 0x6808;
             const device64 = 0x00124b00bb660058n;
             registerNeighborDevice(context, device16, device64);
-            const status = await verifyTCLinkKey(device16, device64, context.tcVerifyKeyHash);
+            const { status } = await verifyTCLinkKey(device16, device64, context.tcVerifyKeyHash);
 
             expect(status).toStrictEqual(0x00);
+        });
+
+        it("seals the confirmation with the key being verified, not the global key", async () => {
+            // 05-3474-23 #4.4.11.8. A joiner that enforces this decrypts CONFIRM_KEY
+            // with the key it was issued; sealing it with the global Trust Center key
+            // leaves it re-sending VERIFY_KEY until key establishment times out, and
+            // it then leaves a network it has already joined.
+            const device16 = 0x6809;
+            const device64 = 0x00124b00bb660059n;
+            const issued = await requestTCLinkKey(device16, device64);
+            const { status, frame } = await verifyTCLinkKey(device16, device64, makeKeyedHash(issued, 0x03));
+
+            expect(status).toStrictEqual(0x00);
+
+            const payload = decodeAPSPayloadWithKey(frame, issued);
+            expect(payload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.CONFIRM_KEY);
+            expect(payload.readUInt8(1)).toStrictEqual(0x00);
+            expect(payload.readBigUInt64LE(3)).toStrictEqual(device64);
+
+            // and the global key must NOT open it, or the assertion above proves nothing
+            expect(() => decodeAPSPayloadWithKey(frame, context.netParams.tcKey)).toThrow();
+        });
+
+        it("still seals the confirmation with the global key for a device with no key of its own", async () => {
+            const device16 = 0x680a;
+            const device64 = 0x00124b00bb66005an;
+            registerNeighborDevice(context, device16, device64);
+            const { status, frame } = await verifyTCLinkKey(device16, device64, context.tcVerifyKeyHash);
+
+            expect(status).toStrictEqual(0x00);
+
+            const payload = decodeAPSPayloadWithKey(frame, context.netParams.tcKey);
+            expect(payload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.CONFIRM_KEY);
+            expect(payload.readUInt8(1)).toStrictEqual(0x00);
         });
 
         it("enforces TC link key request policy during update requests", async () => {
