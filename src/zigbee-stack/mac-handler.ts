@@ -344,22 +344,47 @@ export class MACHandler {
                 address16 === undefined && !this.#context.associationPermit,
             );
 
-            this.#context.pendingAssociations.set(macHeader.source64, {
-                sendResp: async () => {
-                    await this.sendAssocRsp(macHeader.source64!, newAddress16, status);
+            const sendResp = async () => {
+                await this.sendAssocRsp(macHeader.source64!, newAddress16, status);
 
-                    if (status === MACAssociationStatus.SUCCESS && requiresTransportKey) {
-                        await this.#callbacks.onAPSSendTransportKeyNWK(
-                            newAddress16,
-                            this.#context.netParams.networkKey,
-                            this.#context.netParams.networkKeySequenceNumber,
-                            macHeader.source64!,
-                        );
-                        this.#context.markNetworkKeyTransported(macHeader.source64!);
-                    }
-                },
+                if (status === MACAssociationStatus.SUCCESS && requiresTransportKey) {
+                    await this.#callbacks.onAPSSendTransportKeyNWK(
+                        newAddress16,
+                        this.#context.netParams.networkKey,
+                        this.#context.netParams.networkKeySequenceNumber,
+                        macHeader.source64!,
+                    );
+                    this.#context.markNetworkKeyTransported(macHeader.source64!);
+                }
+            };
+
+            this.#context.pendingAssociations.set(macHeader.source64, {
+                sendResp,
                 timestamp: Date.now(),
             });
+
+            // Our deployment only, behind ZOH_DIRECT_ASSOC_RSP=1.
+            //
+            // The response above is indirect: it waits for the device to poll
+            // with a DATA_RQ, which is how a radio tells a child "I have
+            // something for you" -- the ACK's frame-pending bit. A radioless
+            // coordinator has no ACKs at all, and the alternate-MAC interface
+            // on EmberZNet has nowhere to carry that bit either: its transmit
+            // completion struct is {interface, tag, status} and nothing more.
+            // So a mains-powered router that joins over the tunnel sends its
+            // association request and then waits forever for a response that
+            // waits forever for a poll.
+            //
+            // For a device that is receiving whenever it is idle, and on a
+            // backhaul with no power budget to protect, answering at once is
+            // both correct and the only thing that completes the join.
+            if (process.env.ZOH_DIRECT_ASSOC_RSP === "1" && decodedCap.rxOnWhenIdle) {
+                // Delete before sending, as processDataReq does not: an await in
+                // between is a window where a poll could take the same response.
+                this.#context.pendingAssociations.delete(macHeader.source64);
+                logger.debug(() => `===> MAC ASSOC_RSP direct[dst64=${macHeader.source64}] no poll to wait for`, NS);
+                await sendResp();
+            }
         }
 
         return offset;
