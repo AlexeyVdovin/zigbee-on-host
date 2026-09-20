@@ -401,7 +401,13 @@ export class StackContext {
         allowJoins: false,
         installCode: InstallCodePolicy.NOT_REQUIRED,
         allowRejoinsWithWellKnownKey: true,
-        issueUniqueTCLinkKeys: false,
+        // Our deployment only. Upstream's default is false and stays false:
+        // every test here is written against the off path, and flipping the
+        // constant fails three of them. We need it on, because the
+        // EFR32MG24 node runs EmberZNet with zigbee_update_tc_link_key and
+        // asks for its own key right after joining; refused, it leaves a
+        // network it has already joined (zb-gw issue 2026-08-24, 37 of 37).
+        issueUniqueTCLinkKeys: process.env.ZOH_UNIQUE_TC_LINK_KEYS === "1",
         allowTCKeyRequest: TrustCenterKeyRequestPolicy.ALLOWED,
         networkKeyUpdatePeriod: 0, // disable
         networkKeyUpdateMethod: NetworkKeyUpdateMethod.BROADCAST,
