@@ -987,6 +987,77 @@ export class StackContext {
     }
 
     /**
+     * 05-3474-23 #4.7.3.1 step 2b
+     *
+     * Drop one key pair.
+     *
+     * An unsecured initial join gives the joiner an apsDeviceKeyPairSet entry
+     * with LinkKey "ZigbeeAlliance09", KeyAttributes PROVISIONAL_KEY and
+     * apsLinkKeyType Global. A unique key issued to a previous incarnation of
+     * the same IEEE is not carried into the new one -- the reset device can
+     * only prove the well-known key, and an inherited entry would make
+     * #tcVerifyKeyHashFor compare that correct proof against the old key and
+     * answer SECURITY_FAILURE. Removing the entry is how this stack says
+     * "well-known": `undefined` selects the global key everywhere downstream.
+     *
+     * Rejoins (#4.7.3.2) are the other case and keep their key.
+     *
+     * SPEC COMPLIANCE NOTES:
+     * - ✅ Canonical pair ordering, so argument order does not matter
+     * - ⚠️  KeyAttributes/apsLinkKeyType are not modelled separately in this
+     *       stack; absence of an entry is the global-key state
+     * DEVICE SCOPE: Trust Center
+     *
+     * @returns Whether an entry was removed
+     */
+    public deleteAppLinkKey(deviceA: bigint, deviceB: bigint): boolean {
+        return this.appLinkKeyTable.delete(this.#makeAppLinkKeyId(deviceA, deviceB));
+    }
+
+    /**
+     * 05-3474-23 #2.4.3.4.7.4 step 7a, #4.7.3.3 steps 4a/6a, #4.7.3.11.1
+     *
+     * Drop every key pair this device takes part in.
+     *
+     * Decommissioning a device deletes its apsDeviceKeyPairSet entry -- "If any
+     * entry matches it SHALL be deleted" (#2.4.3.4.7.4 step 7a) -- and the
+     * Trust Center already deletes the entry when key establishment with a
+     * joiner does not complete (#4.7.3.3 steps 4a and 6a). #4.7.3.11.1
+     * recommends that "old, unused link keys be deleted from the Trust Center
+     * to prevent them from being used", and a device that has left the network
+     * is exactly that: the key it was issued can no longer authenticate
+     * anything, and keeping it makes the Trust Center answer a correct proof of
+     * the well-known key with SECURITY_FAILURE when the device is factory reset
+     * and comes back.
+     *
+     * Application link keys the device shares with third parties go with it:
+     * the partner cannot reach it any more, and a pair with a departed device
+     * is as dead as the device.
+     *
+     * SPEC COMPLIANCE NOTES:
+     * - ✅ Removes Trust Center and application link key pairs alike
+     * - ✅ Canonical pair ordering means the device matches on either side
+     * - ⚠️  Triggered by the leave path rather than by Security_Decommission_req
+     *       (#2.4.3.4.7), which this stack does not implement
+     * DEVICE SCOPE: Trust Center
+     *
+     * @param device64 The device whose key pairs are to be removed
+     * @returns How many entries were removed
+     */
+    public deleteAppLinkKeys(device64: bigint): number {
+        let removed = 0;
+
+        for (const [id, entry] of this.appLinkKeyTable) {
+            if (entry.deviceA === device64 || entry.deviceB === device64) {
+                this.appLinkKeyTable.delete(id);
+                removed += 1;
+            }
+        }
+
+        return removed;
+    }
+
+    /**
      * 05-3474-23 #4.5.1 (Install Code processing)
      *
      * SPEC COMPLIANCE NOTES:
@@ -1507,6 +1578,18 @@ export class StackContext {
         );
 
         if (status === MACAssociationStatus.SUCCESS) {
+            if (initialJoin && this.installCodeTable.get(source64!) === undefined) {
+                // 05-3474-23 #4.7.3.1 step 2b: the entry an unsecured initial
+                // join produces holds the well-known key, not whatever this
+                // IEEE was issued last time it was on the network. See
+                // deleteAppLinkKey.
+                //
+                // An install-code entry is the other branch of the same
+                // section -- provisioned ahead of the join so the device can
+                // authenticate with it -- and is left alone.
+                this.deleteAppLinkKey(source64!, this.netParams.eui64);
+            }
+
             if (initialJoin || unknownRejoin) {
                 this.deviceTable.set(source64!, {
                     address16: newAddress16,
@@ -1559,6 +1642,7 @@ export class StackContext {
      * - ✅ Cleans up pending associations
      * - ✅ Clears MAC NO_ACK counters
      * - ✅ Removes routes using device as relay
+     * - ✅ Removes the device's link key pairs (apsDeviceKeyPairSet entries)
      * - ✅ Triggers onDeviceLeft callback
      * - ✅ Forces state save
      * - ✅ Handles both address16 and address64 resolution
@@ -1581,6 +1665,10 @@ export class StackContext {
             this.sourceRouteTable.delete(source16);
             this.pendingAssociations.delete(source64); // should never amount to a delete
             this.macNoACKs.delete(source16);
+            // The device is gone, so its key pairs are dead with it. Leaving
+            // them behind is what makes a factory-reset device fail to come
+            // back: see deleteAppLinkKeys.
+            const removedKeys = this.deleteAppLinkKeys(source64);
 
             // XXX: should only be needed for `rxOnWhenIdle`, but for now always trigger (tricky bit, not always correct)
             for (const [addr16, entries] of this.sourceRouteTable) {
@@ -1594,7 +1682,7 @@ export class StackContext {
                 }
             }
 
-            logger.debug(() => `DEVICE_LEFT[src=${source16}:${source64}]`, NS);
+            logger.debug(() => `DEVICE_LEFT[src=${source16}:${source64} keyPairsRemoved=${removedKeys}]`, NS);
 
             setImmediate(() => {
                 this.#callbacks.onDeviceLeft(source16, source64);

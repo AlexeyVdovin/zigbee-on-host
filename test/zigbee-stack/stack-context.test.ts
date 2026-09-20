@@ -2,7 +2,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MACCapabilities } from "../../src/zigbee/mac.js";
+import { MACAssociationStatus, type MACCapabilities } from "../../src/zigbee/mac.js";
 import { DeviceTLVTag, readDeviceTLVs, readSourceRouteTLVs, SourceRouteTLVTag, TLVTag } from "../../src/zigbee-stack/save-serializer.js";
 import {
     ApplicationKeyRequestPolicy,
@@ -486,6 +486,96 @@ describe("StackContext", () => {
             const restoredKey = reloadedContext.getAppLinkKey(device64, reloadedContext.netParams.eui64);
 
             expect(restoredKey).toStrictEqual(appLinkKey);
+        });
+
+        it("removes the device's link key pairs when it leaves", async () => {
+            const device64 = 1234n;
+            const partner64 = 5678n;
+            const bystander64 = 9012n;
+            const address16 = 0xabcd;
+
+            context.deviceTable.set(device64, {
+                address16,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                recentLQAs: [],
+            });
+            context.address16ToAddress64.set(address16, device64);
+
+            const tcKey = Buffer.alloc(16, 0x11);
+            const appKey = Buffer.alloc(16, 0x22);
+            const otherKey = Buffer.alloc(16, 0x33);
+
+            context.setAppLinkKey(device64, context.netParams.eui64, tcKey);
+            context.setAppLinkKey(device64, partner64, appKey);
+            context.setAppLinkKey(bystander64, context.netParams.eui64, otherKey);
+
+            expect(context.appLinkKeyTable.size).toStrictEqual(3);
+
+            await context.disassociate(address16, device64);
+
+            // Both pairs the departed device took part in are gone, on either
+            // side of the pair; the bystander's own key is untouched.
+            expect(context.getAppLinkKey(device64, context.netParams.eui64)).toBeUndefined();
+            expect(context.getAppLinkKey(device64, partner64)).toBeUndefined();
+            expect(context.getAppLinkKey(partner64, device64)).toBeUndefined();
+            expect(context.getAppLinkKey(bystander64, context.netParams.eui64)).toStrictEqual(otherKey);
+            expect(context.appLinkKeyTable.size).toStrictEqual(1);
+        });
+
+        it("reports how many key pairs a leave removed", () => {
+            const device64 = 2222n;
+
+            expect(context.deleteAppLinkKeys(device64)).toStrictEqual(0);
+
+            context.setAppLinkKey(device64, context.netParams.eui64, Buffer.alloc(16, 0x44));
+            context.setAppLinkKey(device64, 3333n, Buffer.alloc(16, 0x55));
+
+            expect(context.deleteAppLinkKeys(device64)).toStrictEqual(2);
+            expect(context.deleteAppLinkKeys(device64)).toStrictEqual(0);
+        });
+
+        it("drops the previous incarnation's trust centre key on an initial join", async () => {
+            const device64 = 4444n;
+            const partner64 = 5555n;
+            const staleTCKey = Buffer.alloc(16, 0x66);
+            const appKey = Buffer.alloc(16, 0x77);
+
+            context.trustCenterPolicies.allowJoins = true;
+
+            context.setAppLinkKey(device64, context.netParams.eui64, staleTCKey);
+            context.setAppLinkKey(device64, partner64, appKey);
+
+            const [status] = await context.associate(undefined, device64, true /* initialJoin */, undefined, true, false);
+
+            expect(status).toStrictEqual(MACAssociationStatus.SUCCESS);
+            // The trust centre pair is gone, so the joiner is back to the
+            // well-known key; pairs with third parties are none of this
+            // procedure's business (#4.7.3.1 speaks only of the joiner's entry).
+            expect(context.getAppLinkKey(device64, context.netParams.eui64)).toBeUndefined();
+            expect(context.getAppLinkKey(device64, partner64)).toStrictEqual(appKey);
+        });
+
+        it("keeps the trust centre key across a rejoin", async () => {
+            const device64 = 6666n;
+            const address16 = 0xbeef;
+            const key = Buffer.alloc(16, 0x88);
+
+            context.deviceTable.set(device64, {
+                address16,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                recentLQAs: [],
+            });
+            context.address16ToAddress64.set(address16, device64);
+            context.setAppLinkKey(device64, context.netParams.eui64, key);
+
+            await context.associate(address16, device64, false /* rejoin */, undefined, true, false);
+
+            // #4.7.3.2: a rejoining device is the same device and keeps its key.
+            expect(context.getAppLinkKey(device64, context.netParams.eui64)).toStrictEqual(key);
         });
 
         it("loads state with trailing padding after end marker", async () => {
