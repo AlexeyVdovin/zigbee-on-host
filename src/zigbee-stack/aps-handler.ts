@@ -1863,7 +1863,20 @@ export class APSHandler {
         } else if (status === ZigbeeAPSUpdateDeviceStatus.DEVICE_LEFT) {
             // left
             // TODO: according to spec, this is "informative" only, should not take any action?
-            await this.#context.disassociate(device16, device64);
+            //
+            // dropKeys=false, and the TODO above is the reason. This is a THIRD
+            // PARTY's report -- a router saying a child of its own is gone --
+            // and DEVICE_LEFT carries no rejoin flag, so a device roaming to a
+            // new parent is indistinguishable from one leaving for good. Per
+            // #4.2.3.2 the service exists so the trust centre "maintains an
+            // accurate list of active network devices"; nothing in it says to
+            // destroy key material, and a trust centre pair cannot be
+            // regenerated once destroyed.
+            //
+            // Nothing is lost by declining: a device that really did leave and
+            // comes back factory-reset is reset to the well-known key by the
+            // associate() path, which is where the guarantee actually lives.
+            await this.#context.disassociate(device16, device64, false);
         }
 
         return offset;

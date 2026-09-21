@@ -995,9 +995,12 @@ export class StackContext {
      * with LinkKey "ZigbeeAlliance09", KeyAttributes PROVISIONAL_KEY and
      * apsLinkKeyType Global. A unique key issued to a previous incarnation of
      * the same IEEE is not carried into the new one -- the reset device can
-     * only prove the well-known key, and an inherited entry would make
-     * #tcVerifyKeyHashFor compare that correct proof against the old key and
-     * answer SECURITY_FAILURE. Removing the entry is how this stack says
+     * only prove the well-known key, and an inherited entry would make the
+     * trust centre's verify-key path in APSHandler (which arrives with the
+     * unique TC link keys change; this file cannot see it, and on a tree
+     * without it nothing reads a per-device entry at all) compare that correct
+     * proof against the old key and answer SECURITY_FAILURE. Removing the entry
+     * is how this stack says
      * "well-known": `undefined` selects the global key everywhere downstream.
      *
      * Rejoins (#4.7.3.2) are the other case and keep their key.
@@ -1578,7 +1581,7 @@ export class StackContext {
         );
 
         if (status === MACAssociationStatus.SUCCESS) {
-            if (initialJoin && this.installCodeTable.get(source64!) === undefined) {
+            if (initialJoin && source64 !== undefined && this.installCodeTable.get(source64) === undefined) {
                 // 05-3474-23 #4.7.3.1 step 2b: the entry an unsecured initial
                 // join produces holds the well-known key, not whatever this
                 // IEEE was issued last time it was on the network. See
@@ -1587,7 +1590,7 @@ export class StackContext {
                 // An install-code entry is the other branch of the same
                 // section -- provisioned ahead of the join so the device can
                 // authenticate with it -- and is left alone.
-                this.deleteAppLinkKey(source64!, this.netParams.eui64);
+                this.deleteAppLinkKey(source64, this.netParams.eui64);
             }
 
             if (initialJoin || unknownRejoin) {
@@ -1642,7 +1645,9 @@ export class StackContext {
      * - ✅ Cleans up pending associations
      * - ✅ Clears MAC NO_ACK counters
      * - ✅ Removes routes using device as relay
-     * - ✅ Removes the device's link key pairs (apsDeviceKeyPairSet entries)
+     * - ✅ Removes the device's link key pairs (apsDeviceKeyPairSet entries),
+     *      but only when the caller passes `dropKeys` AND unique trust centre
+     *      link keys are in use -- see the comment at the call
      * - ✅ Triggers onDeviceLeft callback
      * - ✅ Forces state save
      * - ✅ Handles both address16 and address64 resolution
@@ -1650,7 +1655,7 @@ export class StackContext {
      * THOROUGH CLEANUP: All device-related state properly removed
      * DEVICE SCOPE: Coordinator, routers (N/A)
      */
-    public async disassociate(source16: number | undefined, source64: bigint | undefined): Promise<void> {
+    public async disassociate(source16: number | undefined, source64: bigint | undefined, dropKeys = true): Promise<void> {
         if (source64 === undefined && source16 !== undefined) {
             source64 = this.address16ToAddress64.get(source16);
         } else if (source16 === undefined && source64 !== undefined) {
@@ -1668,7 +1673,36 @@ export class StackContext {
             // The device is gone, so its key pairs are dead with it. Leaving
             // them behind is what makes a factory-reset device fail to come
             // back: see deleteAppLinkKeys.
-            const removedKeys = this.deleteAppLinkKeys(source64);
+            //
+            // Narrowed twice, and both guards are load bearing:
+            //
+            //  - `dropKeys` carries the CALLER's intent, because this function
+            //    cannot recover it. A trust centre pair is minted with
+            //    randomBytes and derived from nothing, so deleting one destroys
+            //    it -- unlike an application pair, which
+            //    #getOrGenerateAppLinkKey rebuilds identically from the TC key.
+            //    An informative third-party UPDATE_DEVICE carries no rejoin flag
+            //    and cannot tell a child roaming to a new parent from one
+            //    leaving for good, so it must not reach this.
+            //  - the policy, because with issueUniqueTCLinkKeys off the trust
+            //    centre never ISSUES a unique key, so a deletion here is
+            //    unlikely to be removing anything this stack put there -- while
+            //    still destroying unrecoverable material that a save-file
+            //    restore or an install code may have placed.
+            //
+            //    ⚠️ NOT "with the policy off nothing reads a per-device entry":
+            //    that is false and inviting. #tcVerifyKeyHashFor and
+            //    #tcLinkKeyFor both go through getAppLinkKey with no gate, and
+            //    processVerifyKey has none either, so a stale entry on a
+            //    policy-off tree still answers a correct global-key proof with
+            //    0xad SECURITY_FAILURE. Which is why the gate stops HERE: the
+            //    guarantee lives in associate(), whose deletion is deliberately
+            //    ungated, and extending this gate to that half for symmetry
+            //    would reopen exactly that defect.
+            //
+            // The loss is persisted by the savePeriodicState() below, at once,
+            // so neither guard can be left to a later cleanup.
+            const removedKeys = dropKeys && this.trustCenterPolicies.issueUniqueTCLinkKeys ? this.deleteAppLinkKeys(source64) : 0;
 
             // XXX: should only be needed for `rxOnWhenIdle`, but for now always trigger (tricky bit, not always correct)
             for (const [addr16, entries] of this.sourceRouteTable) {

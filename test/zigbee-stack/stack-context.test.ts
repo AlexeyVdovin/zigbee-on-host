@@ -494,6 +494,10 @@ describe("StackContext", () => {
             const bystander64 = 9012n;
             const address16 = 0xabcd;
 
+            // The deletion is gated on the policy that gives a device a key of
+            // its own in the first place.
+            context.trustCenterPolicies.issueUniqueTCLinkKeys = true;
+
             context.deviceTable.set(device64, {
                 address16,
                 capabilities: undefined,
@@ -522,6 +526,67 @@ describe("StackContext", () => {
             expect(context.getAppLinkKey(partner64, device64)).toBeUndefined();
             expect(context.getAppLinkKey(bystander64, context.netParams.eui64)).toStrictEqual(otherKey);
             expect(context.appLinkKeyTable.size).toStrictEqual(1);
+        });
+
+        it("keeps the keys when the leave is somebody else's report", async () => {
+            // An APS UPDATE_DEVICE with status DEVICE_LEFT is a THIRD PARTY
+            // telling the trust centre about a child of its own. It carries no
+            // rejoin flag, so a device roaming to a new parent looks exactly
+            // like one leaving for good -- and a trust centre key is minted
+            // with randomBytes, so a wrong guess destroys it for good. The
+            // caller passes its intent rather than this function guessing.
+            const device64 = 1234n;
+            const address16 = 0xabcd;
+
+            context.trustCenterPolicies.issueUniqueTCLinkKeys = true;
+            context.deviceTable.set(device64, {
+                address16,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                recentLQAs: [],
+            });
+            context.address16ToAddress64.set(address16, device64);
+
+            const tcKey = Buffer.alloc(16, 0x66);
+            context.setAppLinkKey(device64, context.netParams.eui64, tcKey);
+
+            await context.disassociate(address16, device64, false);
+
+            // The device is gone from the tables, and its key is still there.
+            expect(context.deviceTable.get(device64)).toBeUndefined();
+            expect(context.getAppLinkKey(device64, context.netParams.eui64)).toStrictEqual(tcKey);
+        });
+
+        it("keeps the keys when unique trust centre keys are not in use", async () => {
+            // Upstream default. With the policy off the trust centre never
+            // ISSUES a unique key, so a deletion here is unlikely to remove
+            // anything this stack put there -- while still destroying
+            // unrecoverable material a save-file restore or an install code may
+            // have placed. (Not "nothing reads a per-device entry with the
+            // policy off": the verify-key path reads one regardless. See the
+            // comment in disassociate.)
+            const device64 = 1234n;
+            const address16 = 0xabcd;
+
+            expect(context.trustCenterPolicies.issueUniqueTCLinkKeys).toStrictEqual(false);
+
+            context.deviceTable.set(device64, {
+                address16,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                recentLQAs: [],
+            });
+            context.address16ToAddress64.set(address16, device64);
+
+            const tcKey = Buffer.alloc(16, 0x77);
+            context.setAppLinkKey(device64, context.netParams.eui64, tcKey);
+
+            await context.disassociate(address16, device64);
+
+            expect(context.deviceTable.get(device64)).toBeUndefined();
+            expect(context.getAppLinkKey(device64, context.netParams.eui64)).toStrictEqual(tcKey);
         });
 
         it("reports how many key pairs a leave removed", () => {

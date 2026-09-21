@@ -437,7 +437,13 @@ export class MACHandler {
             const source16 =
                 macHeader.source16 ?? (macHeader.source64 !== undefined ? this.#context.deviceTable.get(macHeader.source64)?.address16 : undefined);
 
-            await this.#context.disassociate(source16, macHeader.source64);
+            // dropKeys=false. Both reasons name a first party, so the intent is
+            // less doubtful than an UPDATE_DEVICE report -- but a MAC
+            // disassociation still carries no rejoin flag, and the key it would
+            // destroy cannot be regenerated. Declining costs nothing: a device
+            // that really left and returns factory-reset is put back on the
+            // well-known key by the associate() path.
+            await this.#context.disassociate(source16, macHeader.source64, false);
         }
 
         return offset;

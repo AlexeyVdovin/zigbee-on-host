@@ -1083,7 +1083,12 @@ describe("IEEE 802.15.4-2020 MAC Layer Compliance", () => {
 
             await macHandler.processCommand(Buffer.from([MACDisassociationReason.COORDINATOR_INITIATED]), buildDisassocHeader());
 
-            expect(disassociateSpy).toHaveBeenCalledWith(disassocDest16, undefined);
+            // dropKeys=false: a MAC disassociation is not authenticated, so
+            // honouring it by destroying a trust centre key -- which is minted
+            // with randomBytes and cannot be regenerated -- would be a
+            // revocation primitive that needs no credentials. The device state
+            // below is still removed.
+            expect(disassociateSpy).toHaveBeenCalledWith(disassocDest16, undefined, false);
             expect(context.deviceTable.has(disassocDest64)).toStrictEqual(false);
             expect(context.address16ToAddress64.has(disassocDest16)).toStrictEqual(false);
             expect(context.indirectTransmissions.has(disassocDest64)).toStrictEqual(false);
@@ -1095,7 +1100,8 @@ describe("IEEE 802.15.4-2020 MAC Layer Compliance", () => {
 
             await macHandler.processCommand(Buffer.from([MACDisassociationReason.DEVICE_INITIATED]), buildDisassocHeader());
 
-            expect(disassociateSpy).toHaveBeenCalledWith(disassocDest16, undefined);
+            // Same reasoning as above: the device state goes, the key stays.
+            expect(disassociateSpy).toHaveBeenCalledWith(disassocDest16, undefined, false);
             expect(context.deviceTable.has(disassocDest64)).toStrictEqual(false);
         });
     });
