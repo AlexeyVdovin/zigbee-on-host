@@ -1478,6 +1478,65 @@ describe("APS Handler", () => {
         });
     });
 
+    describe("Update Device: device left", () => {
+        const parentMac = { frameControl: {}, source16: 0x8fca, source64: 0x744dbdfffe620ec5n } as MACHeader;
+        const parentNwk = { frameControl: {}, source16: 0x8fca, source64: 0x744dbdfffe620ec5n } as ZigbeeNWKHeader;
+        const device64 = 0x06e3e5fffe681602n;
+
+        const deviceLeft = (device16: number): Buffer => {
+            const payload = Buffer.alloc(11);
+            let offset = payload.writeBigUInt64LE(device64, 0);
+            offset = payload.writeUInt16LE(device16, offset);
+            payload.writeUInt8(0x02, offset); // Device Left
+
+            return payload;
+        };
+
+        it("ignores a report naming an address the device no longer holds", async () => {
+            // The device left from 0xd871 and rejoined straight away as 0xf840;
+            // its former parent reports the old address gone 30 s later.
+            mockContext.deviceTable.set(device64, {
+                address16: 0xf840,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+
+            await apsHandler.processUpdateDevice(deviceLeft(0xd871), 0, parentMac, parentNwk, {} as ZigbeeAPSHeader);
+
+            expect(mockContext.disassociate).not.toHaveBeenCalled();
+        });
+
+        it("acts on a report naming the device's current address", async () => {
+            mockContext.deviceTable.set(device64, {
+                address16: 0xd871,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+
+            await apsHandler.processUpdateDevice(deviceLeft(0xd871), 0, parentMac, parentNwk, {} as ZigbeeAPSHeader);
+
+            expect(mockContext.disassociate).toHaveBeenCalledWith(0xd871, device64, false);
+        });
+
+        it("acts on a report for a device it has no entry for", async () => {
+            await apsHandler.processUpdateDevice(deviceLeft(0xd871), 0, parentMac, parentNwk, {} as ZigbeeAPSHeader);
+
+            expect(mockContext.disassociate).toHaveBeenCalledWith(0xd871, device64, false);
+        });
+    });
+
     it("skips duplicate detection when APS counter is absent", () => {
         const nwkHeader = { source16: 0x4f01 } as ZigbeeNWKHeader;
         const header = {
