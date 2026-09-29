@@ -1429,6 +1429,8 @@ export class StackContext {
      * - ✅ Returns appropriate status codes per IEEE 802.15.4
      * - ✅ Triggers state save after association
      * - ⚠️ Unknown rejoins succeed if allowOverride=true (potential security risk)
+     * - ✅ With allowOverride=true, a device is unknown when its IEEE address is, whoever its short address is recorded for
+     * - ✅ Releases a known device's old address when it takes a new one, unless another device was recorded there since
      * - ✅ Enforces install code requirement (denies initial join when missing)
      * - ✅ Detects network key changes on rejoin and schedules transport
      * DEVICE SCOPE: Coordinator, routers (N/A)
@@ -1461,7 +1463,11 @@ export class StackContext {
             newAddress16 = 0xffff;
             status = MACAssociationStatus.PAN_ACCESS_DENIED;
         } else if (allowOverride) {
-            if ((source16 === undefined || !this.address16ToAddress64.has(source16)) && (source64 === undefined || !this.deviceTable.has(source64))) {
+            // a device is known by its IEEE address; its short address is known only when no IEEE address was given,
+            // because the one a parent reports may already be recorded for another device (a conflict, reported by the caller)
+            const known = source64 !== undefined ? this.deviceTable.has(source64) : source16 !== undefined && this.address16ToAddress64.has(source16);
+
+            if (!known) {
                 // device unknown
                 unknownRejoin = true;
                 requiresTransportKey = true;
@@ -1591,6 +1597,13 @@ export class StackContext {
                 // section -- provisioned ahead of the join so the device can
                 // authenticate with it -- and is left alone.
                 this.deleteAppLinkKey(source64, this.netParams.eui64);
+            }
+
+            const previous16 = source64 !== undefined ? this.deviceTable.get(source64)?.address16 : undefined;
+
+            // a known device joining or rejoining under a new address releases its old one, unless another device was recorded there since
+            if (previous16 !== undefined && previous16 !== newAddress16 && this.address16ToAddress64.get(previous16) === source64) {
+                this.address16ToAddress64.delete(previous16);
             }
 
             if (initialJoin || unknownRejoin) {

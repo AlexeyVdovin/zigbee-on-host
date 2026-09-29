@@ -1432,6 +1432,119 @@ describe("Zigbee 3.0 Application Support (APS) Layer Compliance", () => {
 
             mockMACHandlerCallbacks.onSendFrame = vi.fn();
         });
+
+        describe("address conflicts (§3.6.1.10.2)", () => {
+            const holder16 = 0x3c10;
+            const holder64 = 0x00124b00f0f0a001n;
+            const device64 = 0x00124b00f0f0a002n;
+            let counter = 0x40;
+
+            async function receiveUpdateDevice(address64: bigint, address16: number, status: number, security = true): Promise<void> {
+                const payload = Buffer.alloc(1 + 8 + 2 + 1);
+                payload.writeUInt8(ZigbeeAPSCommandId.UPDATE_DEVICE, 0);
+                payload.writeBigUInt64LE(address64, 1);
+                payload.writeUInt16LE(address16, 9);
+                payload.writeUInt8(status, 11);
+
+                const macHeader: MACHeader = {
+                    frameControl: createMACFrameControl(MACFrameType.DATA, MACFrameAddressMode.SHORT, MACFrameAddressMode.SHORT),
+                    sequenceNumber: 0x30,
+                    destinationPANId: netParams.panId,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: parent16,
+                    commandId: undefined,
+                    fcs: 0,
+                };
+                const nwkHeader: ZigbeeNWKHeader = {
+                    frameControl: {
+                        frameType: ZigbeeNWKFrameType.DATA,
+                        protocolVersion: ZigbeeNWKConsts.VERSION_2007,
+                        discoverRoute: ZigbeeNWKRouteDiscovery.SUPPRESS,
+                        multicast: false,
+                        security,
+                        sourceRoute: false,
+                        extendedDestination: false,
+                        extendedSource: true,
+                        endDeviceInitiator: false,
+                    },
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: parent16,
+                    source64: parent64,
+                    radius: 5,
+                    seqNum: 0x30,
+                };
+                const apsHeader: ZigbeeAPSHeader = {
+                    frameControl: {
+                        frameType: ZigbeeAPSFrameType.CMD,
+                        deliveryMode: ZigbeeAPSDeliveryMode.UNICAST,
+                        ackFormat: false,
+                        security: true,
+                        ackRequest: true,
+                        extendedHeader: false,
+                    },
+                    counter: counter++,
+                };
+
+                await apsHandler.processCommand(payload, macHeader, nwkHeader, apsHeader);
+            }
+
+            beforeEach(() => {
+                mockMACHandlerCallbacks.onSendFrame = vi.fn(() => Promise.resolve());
+                registerNeighborDevice(context, holder16, holder64);
+            });
+
+            it("records an unknown device that rejoins at an address recorded for another device, and reports the conflict", async () => {
+                const reportSpy = vi.spyOn(nwkHandler, "reportAddressConflict").mockReturnValue();
+
+                await receiveUpdateDevice(device64, holder16, ZigbeeAPSConsts.CMD_UPDATE_STANDARD_SEC_REJOIN);
+
+                expect(reportSpy).toHaveBeenCalledWith(holder16, [holder64, device64]);
+                expect(context.deviceTable.get(device64)?.address16).toStrictEqual(holder16);
+                expect(context.address16ToAddress64.get(holder16)).toStrictEqual(device64);
+            });
+
+            it("reports a join at an address recorded for another device", async () => {
+                const reportSpy = vi.spyOn(nwkHandler, "reportAddressConflict").mockReturnValue();
+
+                await receiveUpdateDevice(device64, holder16, ZigbeeAPSConsts.CMD_UPDATE_STANDARD_UNSEC_JOIN);
+
+                expect(reportSpy).toHaveBeenCalledWith(holder16, [holder64, device64]);
+            });
+
+            it("does not report a conflict seen in an unsecured frame (§3.6.1.10.4)", async () => {
+                const reportSpy = vi.spyOn(nwkHandler, "reportAddressConflict").mockReturnValue();
+
+                await receiveUpdateDevice(device64, holder16, ZigbeeAPSConsts.CMD_UPDATE_STANDARD_UNSEC_JOIN, false);
+
+                expect(reportSpy).not.toHaveBeenCalled();
+            });
+
+            it.each([
+                ["secured rejoin", ZigbeeAPSConsts.CMD_UPDATE_STANDARD_SEC_REJOIN],
+                ["unsecured join", ZigbeeAPSConsts.CMD_UPDATE_STANDARD_UNSEC_JOIN],
+                ["trust center rejoin", ZigbeeAPSConsts.CMD_UPDATE_STANDARD_UNSEC_REJOIN],
+            ])("releases the old address of a known device that takes a new one (%s)", async (_label, status) => {
+                const reportSpy = vi.spyOn(nwkHandler, "reportAddressConflict").mockReturnValue();
+
+                await receiveUpdateDevice(holder64, 0x3c20, status);
+
+                expect(reportSpy).not.toHaveBeenCalled();
+                expect(context.address16ToAddress64.has(holder16)).toStrictEqual(false);
+                expect(context.address16ToAddress64.get(0x3c20)).toStrictEqual(holder64);
+                expect(context.deviceTable.get(holder64)?.address16).toStrictEqual(0x3c20);
+            });
+
+            it("keeps an old address that another device was recorded at since", async () => {
+                // the other device was recorded at the holder's address since
+                context.deviceTable.set(device64, { ...context.deviceTable.get(holder64)!, address16: holder16 });
+                context.address16ToAddress64.set(holder16, device64);
+
+                await receiveUpdateDevice(holder64, 0x3c20, ZigbeeAPSConsts.CMD_UPDATE_STANDARD_SEC_REJOIN);
+
+                expect(context.address16ToAddress64.get(holder16)).toStrictEqual(device64);
+                expect(context.address16ToAddress64.get(0x3c20)).toStrictEqual(holder64);
+            });
+        });
     });
 
     /**

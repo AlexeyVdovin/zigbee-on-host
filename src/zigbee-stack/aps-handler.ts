@@ -1754,6 +1754,7 @@ export class APSHandler {
      *       - Encrypts tunneled APS frame with TRANSPORT keyId ✅
      *       - However, should verify parent can relay before trusting join
      * - ✅ Status 0x03 (TC Rejoin) re-distributes NWK key when device lacks latest sequence
+     * - ✅ Reports an address conflict when a join or rejoin names an address recorded for another device (#3.6.1.10.2)
      * - ⚠️  Status 0x02 (Device Left) handling uses onDisassociate - spec says "informative only, should not take action"
      *       This may be non-compliant as it actively removes the device
      *
@@ -1786,6 +1787,16 @@ export class APSHandler {
                 `<=== APS UPDATE_DEVICE[macSrc=${macHeader.source16}:${macHeader.source64} nwkSrc=${nwkHeader.source16}:${nwkHeader.source64} dev=${device16}:${device64} status=${status} src16=${nwkHeader.source16}]`,
             NS,
         );
+
+        if (status !== ZigbeeAPSUpdateDeviceStatus.DEVICE_LEFT) {
+            const holder64 = this.#context.address16ToAddress64.get(device16);
+
+            if (holder64 !== undefined && holder64 !== device64 && nwkHeader.frameControl.security) {
+                // #3.6.1.10.2: the parent gave the device an address recorded for another device (it checks only its own
+                // address map, #3.6.1.10.3); the device is recorded there all the same, and the report makes both move off it
+                this.#nwkHandler.reportAddressConflict(device16, [holder64, device64]);
+            }
+        }
 
         if (status === ZigbeeAPSUpdateDeviceStatus.STANDARD_DEVICE_SECURED_REJOIN) {
             await this.#context.associate(
