@@ -2511,6 +2511,135 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
             expect(context.deviceTable.get(router64)!.neighbor).toStrictEqual(true);
             expect(nwkHandler.findBestSourceRoute(router16, router64)).toStrictEqual([undefined, undefined, 1]);
         });
+
+        describe("address conflict detection (§3.6.1.10.2, §3.6.1.10.5)", () => {
+            const shared16 = 0x6c1d;
+            const recorded64 = 0x00124b0011110001n;
+            const other64 = 0x00124b0011110002n;
+            let frames: Buffer[];
+
+            function routerCapabilities(): MACCapabilities {
+                return {
+                    alternatePANCoordinator: false,
+                    deviceType: ZigbeeMACConsts.DEVICE_TYPE_FFD,
+                    powerSource: 1,
+                    rxOnWhenIdle: true,
+                    securityCapability: true,
+                    allocateAddress: true,
+                };
+            }
+
+            function sentCommands(): Array<{ nwkHeader: ZigbeeNWKHeader; nwkPayload: Buffer }> {
+                return frames.map((frame) => {
+                    const { nwkHeader, nwkPayload } = decodeNWKFromMacFrame(decodeMACFramePayload(frame), true);
+
+                    return { nwkHeader, nwkPayload };
+                });
+            }
+
+            async function receiveLinkStatus(source64: bigint, security = true): Promise<void> {
+                const { macHeader, nwkHeader } = makeLinkStatusHeaders(shared16, source64);
+                nwkHeader.frameControl.security = security;
+
+                await nwkHandler.processCommand(
+                    encodeLinkStatusPayload([{ address: ZigbeeConsts.COORDINATOR_ADDRESS, incomingCost: 1, outgoingCost: 1 }]),
+                    macHeader,
+                    nwkHeader,
+                );
+            }
+
+            beforeEach(() => {
+                vi.useFakeTimers();
+                frames = [];
+                mockMACHandlerCallbacks.onSendFrame = vi.fn((payload: Buffer) => {
+                    frames.push(Buffer.from(payload));
+                    return Promise.resolve();
+                });
+                context.sourceRouteTable.clear();
+                registerDevice(context, shared16, recorded64, false, routerCapabilities());
+            });
+
+            afterEach(() => {
+                vi.useRealTimers();
+            });
+
+            it("reports a link status from an IEEE address not recorded at its short address, and credits nobody", async () => {
+                await receiveLinkStatus(other64);
+
+                expect(frames).toHaveLength(0);
+                expect(context.sourceRouteTable.has(shared16)).toStrictEqual(false);
+                expect(context.deviceTable.get(recorded64)?.neighbor).toStrictEqual(false);
+
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                const sent = sentCommands();
+                expect(sent).toHaveLength(1);
+                expect(sent[0]!.nwkHeader.destination16).toStrictEqual(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE);
+                expect(sent[0]!.nwkPayload.readUInt8(0)).toStrictEqual(ZigbeeNWKCommandId.NWK_STATUS);
+                expect(sent[0]!.nwkPayload.readUInt8(1)).toStrictEqual(ZigbeeNWKStatus.ADDRESS_CONFLICT);
+                expect(sent[0]!.nwkPayload.readUInt16LE(2)).toStrictEqual(shared16);
+            });
+
+            it("reports one conflict once however often it is seen", async () => {
+                await receiveLinkStatus(other64);
+                await receiveLinkStatus(other64);
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                expect(frames).toHaveLength(1);
+            });
+
+            it("does not report a conflict seen in an unsecured frame (§3.6.1.10.4)", async () => {
+                await receiveLinkStatus(other64, false);
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                expect(frames).toHaveLength(0);
+            });
+
+            it("still credits a link status from the device recorded at the address", async () => {
+                await receiveLinkStatus(recorded64);
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                expect(frames).toHaveLength(0);
+                expect(context.sourceRouteTable.has(shared16)).toStrictEqual(true);
+            });
+
+            it("cancels its report when the same conflict is reported during the jitter", async () => {
+                const reporter16 = 0x2b3c;
+                await receiveLinkStatus(other64);
+
+                const status = Buffer.from([ZigbeeNWKCommandId.NWK_STATUS, ZigbeeNWKStatus.ADDRESS_CONFLICT, shared16 & 0xff, shared16 >> 8]);
+                const { macHeader, nwkHeader } = makeLinkStatusHeaders(reporter16, 0x00124b0011110003n);
+                await nwkHandler.processCommand(status, macHeader, nwkHeader);
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                expect(frames).toHaveLength(0);
+            });
+
+            it("gives an end device child among the holders a new address", async () => {
+                registerDevice(context, shared16, recorded64, true, {
+                    ...routerCapabilities(),
+                    deviceType: ZigbeeMACConsts.DEVICE_TYPE_RFD,
+                    rxOnWhenIdle: true,
+                });
+
+                await receiveLinkStatus(other64);
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                const sent = sentCommands();
+                expect(sent).toHaveLength(2);
+                expect(sent[0]!.nwkPayload.readUInt8(0)).toStrictEqual(ZigbeeNWKCommandId.NWK_STATUS);
+                expect(sent[1]!.nwkPayload.readUInt8(0)).toStrictEqual(ZigbeeNWKCommandId.REJOIN_RESP);
+                expect(sent[1]!.nwkHeader.destination16).toStrictEqual(shared16);
+                expect(sent[1]!.nwkHeader.destination64).toStrictEqual(recorded64);
+            });
+
+            it("never reports the coordinator's own address", async () => {
+                nwkHandler.reportAddressConflict(ZigbeeConsts.COORDINATOR_ADDRESS, [recorded64, other64]);
+                await vi.advanceTimersByTimeAsync(0x40);
+
+                expect(frames).toHaveLength(0);
+            });
+        });
     });
 
     /**

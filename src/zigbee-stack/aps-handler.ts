@@ -1152,6 +1152,13 @@ export class APSHandler {
                         const capabilities = data.readUInt8(offset);
                         offset += 1;
 
+                        const holder64 = this.#context.address16ToAddress64.get(address16);
+
+                        if (holder64 !== undefined && holder64 !== address64 && nwkHeader.frameControl.security) {
+                            // #3.6.1.10.2: another device is recorded at the announced address
+                            this.#nwkHandler.reportAddressConflict(address16, [holder64, address64]);
+                        }
+
                         const device = this.#context.deviceTable.get(address64);
 
                         if (device === undefined) {
@@ -1161,8 +1168,13 @@ export class APSHandler {
 
                         const decodedCap = decodeMACCapabilities(capabilities);
 
-                        if (device.address16 !== address16) {
-                            this.#context.address16ToAddress64.delete(device.address16);
+                        if (device.address16 !== address16 || holder64 !== address64) {
+                            // release the old address only if it is still this device's, not if another device was recorded there since
+                            if (device.address16 !== address16 && this.#context.address16ToAddress64.get(device.address16) === address64) {
+                                this.#context.address16ToAddress64.delete(device.address16);
+                            }
+
+                            // the announcing device holds the address now; the conflict report makes both holders move off it
                             this.#context.address16ToAddress64.set(address16, address64);
 
                             device.address16 = address16;

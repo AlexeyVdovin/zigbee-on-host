@@ -920,6 +920,96 @@ describe("APS Handler", () => {
             expect(mockCallbacks.onDeviceRejoined).not.toHaveBeenCalled();
         });
 
+        describe("address conflict on end device announce (§3.6.1.10.2)", () => {
+            const holder16 = 0x6611;
+            const holder64 = 0x00124b0000006611n;
+            const announcer64 = 0x00124b0000006612n;
+
+            function registerAt(address16: number, address64: bigint): void {
+                mockContext.deviceTable.set(address64, {
+                    address16,
+                    capabilities: undefined,
+                    authorized: true,
+                    neighbor: false,
+                    lastTransportedNetworkKeySeq: undefined,
+                    recentLQAs: [],
+                    incomingNWKFrameCounter: undefined,
+                    endDeviceTimeout: undefined,
+                    linkStatusMisses: 0,
+                });
+                mockContext.address16ToAddress64.set(address16, address64);
+            }
+
+            async function announce(address16: number, address64: bigint, security = true): Promise<void> {
+                const payload = Buffer.alloc(12);
+                payload.writeUInt8(0x04, 0);
+                payload.writeUInt16LE(address16, 1);
+                payload.writeBigUInt64LE(address64, 3);
+                payload.writeUInt8(0x8e, 11);
+
+                const macHeader = { frameControl: {}, source16: address16, destination16: ZigbeeConsts.COORDINATOR_ADDRESS } as MACHeader;
+                const nwkHeader = {
+                    frameControl: { security },
+                    source16: address16,
+                    destination16: ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE,
+                } as ZigbeeNWKHeader;
+                const apsHeader = {
+                    frameControl: {
+                        frameType: ZigbeeAPSFrameType.DATA,
+                        deliveryMode: ZigbeeAPSDeliveryMode.BCAST,
+                        ackFormat: false,
+                        security: false,
+                        ackRequest: false,
+                        extendedHeader: false,
+                    },
+                    destEndpoint: ZigbeeConsts.ZDO_ENDPOINT,
+                    clusterId: ZigbeeConsts.END_DEVICE_ANNOUNCE,
+                    profileId: ZigbeeConsts.ZDO_PROFILE_ID,
+                    sourceEndpoint: ZigbeeConsts.ZDO_ENDPOINT,
+                    counter: 0x14,
+                } as ZigbeeAPSHeader;
+
+                await apsHandler.processFrame(payload, macHeader, nwkHeader, apsHeader, 150);
+                await new Promise((resolve) => setImmediate(resolve));
+            }
+
+            it("reports an announce of an address recorded for another device", async () => {
+                const reportSpy = vi.spyOn(mockNWKHandler, "reportAddressConflict").mockReturnValue();
+                registerAt(holder16, holder64);
+                registerAt(0x6613, announcer64);
+
+                await announce(holder16, announcer64);
+
+                expect(reportSpy).toHaveBeenCalledWith(holder16, [holder64, announcer64]);
+                expect(mockContext.address16ToAddress64.get(holder16)).toStrictEqual(announcer64);
+                expect(mockContext.address16ToAddress64.has(0x6613)).toStrictEqual(false);
+                expect(mockContext.deviceTable.get(announcer64)?.address16).toStrictEqual(holder16);
+            });
+
+            it("does not report a conflict seen in an unsecured announce (§3.6.1.10.4)", async () => {
+                const reportSpy = vi.spyOn(mockNWKHandler, "reportAddressConflict").mockReturnValue();
+                registerAt(holder16, holder64);
+                registerAt(0x6613, announcer64);
+
+                await announce(holder16, announcer64, false);
+
+                expect(reportSpy).not.toHaveBeenCalled();
+            });
+
+            it("leaves the old address to the device recorded there since", async () => {
+                const reportSpy = vi.spyOn(mockNWKHandler, "reportAddressConflict").mockReturnValue();
+                registerAt(holder16, announcer64);
+                // another device was recorded at the announcer's address since
+                mockContext.address16ToAddress64.set(holder16, holder64);
+
+                await announce(0x6614, announcer64);
+
+                expect(reportSpy).not.toHaveBeenCalled();
+                expect(mockContext.address16ToAddress64.get(holder16)).toStrictEqual(holder64);
+                expect(mockContext.address16ToAddress64.get(0x6614)).toStrictEqual(announcer64);
+            });
+        });
+
         it("throws when APS frame type is unsupported", async () => {
             const macHeader = { frameControl: {}, source16: 0x6611, destination16: ZigbeeConsts.COORDINATOR_ADDRESS } as MACHeader;
             const nwkHeader = { frameControl: {}, source16: 0x6611, destination16: ZigbeeConsts.COORDINATOR_ADDRESS } as ZigbeeNWKHeader;

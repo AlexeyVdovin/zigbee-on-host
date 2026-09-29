@@ -76,6 +76,8 @@ const CONFIG_NWK_ROUTE_MAX_FAILURES = 3;
 const CONFIG_NWK_CONCENTRATOR_MIN_TIME = 10000;
 /** The maximum number of hops in a source route. */
 const CONFIG_NWK_MAX_SOURCE_ROUTE = 0x0c;
+/** nwkcMaxBroadcastJitter: the maximum broadcast jitter time (msec) */
+const CONFIG_NWK_MAX_BROADCAST_JITTER = 0x40;
 // export const CONFIG_NWK_MAX_ROUTERS = 6; // ignored, no limit with host-based
 // export const CONFIG_NWK_MAX_CHILDREN = 20; // ignored, no limit with host-based
 
@@ -103,6 +105,8 @@ export class NWKHandler {
     #manyToOneRouteRequestTimeout: NodeJS.Timeout | undefined;
     /** Address conflicts answered for an end device child, by its IEEE address, until the rejoin response can no longer reach it */
     readonly #childConflictResolutions = new Map<bigint, { address16: number; newAddress16: number; expiresAt: number }>();
+    /** Address conflicts this coordinator detected, by address, while their NWK status broadcast waits out its jitter */
+    readonly #pendingConflictReports = new Map<number, { timeout: NodeJS.Timeout; holders64: bigint[] }>();
     /** Time of last many-to-one route request */
     #lastMTORRTime = 0;
 
@@ -132,6 +136,12 @@ export class NWKHandler {
         this.#manyToOneRouteRequestTimeout = undefined;
 
         this.#childConflictResolutions.clear();
+
+        for (const { timeout } of this.#pendingConflictReports.values()) {
+            clearTimeout(timeout);
+        }
+
+        this.#pendingConflictReports.clear();
     }
 
     /**
@@ -1325,6 +1335,7 @@ export class NWKHandler {
      * - ✅ Logs network status issues for diagnostics
      * - ❌ NOT IMPLEMENTED: TLV processing (R23)
      * - ✅ Resolves an address conflict on an end device child with an unsolicited REJOIN_RESP carrying a new address (#3.6.1.10.5)
+     * - ✅ Cancels its own pending report of the same conflict (#3.6.1.10.5)
      * - ✅ Leaves a conflict on a router to the router, and one on another parent's end device to that parent (#3.6.1.10.5)
      * DEVICE SCOPE: Coordinator, routers (N/A), end devices (N/A)
      *
@@ -1354,6 +1365,18 @@ export class NWKHandler {
             target16 = data.readUInt16LE(offset);
             offset += 2;
 
+            const pending = this.#pendingConflictReports.get(target16);
+
+            if (pending !== undefined) {
+                // "If during this delay a network status is received with the identical payload, the device SHALL cancel its own broadcast"
+                clearTimeout(pending.timeout);
+                this.#pendingConflictReports.delete(target16);
+
+                for (const holder64 of pending.holders64) {
+                    await this.resolveChildAddressConflict(target16, holder64);
+                }
+            }
+
             // #3.6.1.10.5: the coordinator never changes its address, and a router that changes its own announces it,
             // so the only conflict the coordinator resolves is one on the address of its own end device child
             if (target16 !== ZigbeeConsts.COORDINATOR_ADDRESS) {
@@ -1381,6 +1404,44 @@ export class NWKHandler {
         );
 
         return offset;
+    }
+
+    /**
+     * 05-3474-23 #3.6.1.10.2 / #3.6.1.10.5
+     *
+     * The coordinator has seen more than one device use `address16`: "If a Zigbee coordinator or Router determines that there are
+     * multiple users of an address that is not its own, it SHALL inform the network by broadcasting a network status command with
+     * a status code of 0x0d".
+     *
+     * SPEC COMPLIANCE:
+     * - ✅ Broadcasts NWK_STATUS 0x0d with the conflicting address to 0xfffd, after a jitter bounded by nwkcMaxBroadcastJitter
+     * - ✅ Cancels the broadcast if a status with the identical payload arrives during the jitter (see `processStatus`)
+     * - ✅ Resolves the conflict for any holder that is an end device child of the coordinator
+     * - ✅ Never reports the coordinator's own address, which it SHALL NOT change
+     * - ⚠️  Callers report only what arrived NWK-secured: unsecured frames SHALL NOT generate a notification (#3.6.1.10.4)
+     * DEVICE SCOPE: Coordinator, routers (N/A)
+     *
+     * @param address16 The conflicting address
+     * @param holders64 The IEEE addresses seen using it
+     */
+    public reportAddressConflict(address16: number, holders64: bigint[]): void {
+        if (address16 === ZigbeeConsts.COORDINATOR_ADDRESS || address16 >= ZigbeeConsts.BCAST_MIN || this.#pendingConflictReports.has(address16)) {
+            return;
+        }
+
+        logger.warning(() => `NWK address conflict detected on ${address16} between ${holders64.join(", ")}`, NS);
+
+        const timeout = setTimeout(async () => {
+            this.#pendingConflictReports.delete(address16);
+
+            await this.sendStatus(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, ZigbeeNWKStatus.ADDRESS_CONFLICT, address16);
+
+            for (const holder64 of holders64) {
+                await this.resolveChildAddressConflict(address16, holder64);
+            }
+        }, Math.random() * CONFIG_NWK_MAX_BROADCAST_JITTER);
+
+        this.#pendingConflictReports.set(address16, { timeout, holders64 });
     }
 
     /**
@@ -1821,13 +1882,20 @@ export class NWKHandler {
         const linkCount = options & ZigbeeNWKConsts.CMD_LINK_OPTION_COUNT_MASK;
         const links: ZigbeeNWKLinkStatus[] = [];
 
-        let device = nwkHeader.source64 !== undefined ? this.#context.deviceTable.get(nwkHeader.source64) : undefined;
+        const recorded64 = nwkHeader.source16 !== undefined ? this.#context.address16ToAddress64.get(nwkHeader.source16) : undefined;
+        let device: DeviceTableEntry | undefined;
 
-        if (device === undefined && nwkHeader.source16 !== undefined) {
-            const source64 = this.#context.address16ToAddress64.get(nwkHeader.source16);
+        if (recorded64 !== undefined && nwkHeader.source64 !== undefined && recorded64 !== nwkHeader.source64) {
+            // #3.6.1.10.2: the sender's IEEE address is not the one recorded at its short address, so two devices use it,
+            // and the links it reports are not the recorded device's to credit
+            if (nwkHeader.frameControl.security) {
+                this.reportAddressConflict(nwkHeader.source16!, [recorded64, nwkHeader.source64]);
+            }
+        } else {
+            device = nwkHeader.source64 !== undefined ? this.#context.deviceTable.get(nwkHeader.source64) : undefined;
 
-            if (source64 !== undefined) {
-                device = this.#context.deviceTable.get(source64);
+            if (device === undefined && recorded64 !== undefined) {
+                device = this.#context.deviceTable.get(recorded64);
             }
         }
 
