@@ -2073,7 +2073,7 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
                 nwkSource16?: number;
                 source64?: bigint;
             },
-        ): Promise<{ nwkFrameControl: ReturnType<typeof decodeZigbeeNWKFrameControl>[0]; nwkPayload: Buffer }> {
+        ): Promise<{ nwkFrameControl: ReturnType<typeof decodeZigbeeNWKFrameControl>[0]; nwkHeader: ZigbeeNWKHeader; nwkPayload: Buffer }> {
             const frames: Buffer[] = [];
             mockMACHandlerCallbacks.onSendFrame = vi.fn((payload: Buffer) => {
                 frames.push(Buffer.from(payload));
@@ -2087,11 +2087,11 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
 
             expect(frames).toHaveLength(1);
             const macFrame = decodeMACFramePayload(frames[0]!);
-            const { nwkFrameControl, nwkPayload } = decodeNWKFromMacFrame(macFrame, true);
+            const { nwkFrameControl, nwkHeader: responseHeader, nwkPayload } = decodeNWKFromMacFrame(macFrame, true);
 
             mockMACHandlerCallbacks.onSendFrame = vi.fn();
 
-            return { nwkFrameControl, nwkPayload };
+            return { nwkFrameControl, nwkHeader: responseHeader, nwkPayload };
         }
 
         beforeEach(() => {
@@ -2180,6 +2180,38 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
             expect(nwkPayload.readUInt8(3)).toStrictEqual(MACAssociationStatus.PAN_ACCESS_DENIED);
 
             await new Promise((resolve) => setImmediate(resolve));
+        });
+
+        describe("addresses the response to the requestor's IEEE address (§3.6.1.6.1.2)", () => {
+            it("when the rejoin succeeds", async () => {
+                const { nwkHeader, nwkPayload } = await captureRejoinResponse(encodeMACCapabilities(baseCapabilities));
+
+                expect(nwkPayload.readUInt8(3)).toStrictEqual(MACAssociationStatus.SUCCESS);
+                expect(nwkHeader.destination16).toStrictEqual(rejoiner16);
+                expect(nwkHeader.destination64).toStrictEqual(rejoiner64);
+            });
+
+            it("when the rejoin is answered with an address conflict", async () => {
+                const holder64 = 0x00124b00ccddee33n;
+                registerDevice(context, rejoiner16, holder64, true, { ...baseCapabilities });
+                context.deviceTable.get(rejoiner64)!.address16 = 0x5523;
+                context.address16ToAddress64.set(0x5523, rejoiner64);
+
+                const { nwkHeader, nwkPayload } = await captureRejoinResponse(encodeMACCapabilities(baseCapabilities));
+
+                expect(nwkPayload.readUInt8(3)).toStrictEqual(ZigbeeNWKConsts.ASSOC_STATUS_ADDR_CONFLICT);
+                expect(nwkHeader.destination16).toStrictEqual(rejoiner16);
+                expect(nwkHeader.destination64).toStrictEqual(rejoiner64);
+            });
+
+            it("when the rejoin is denied", async () => {
+                context.deviceTable.get(rejoiner64)!.authorized = false;
+
+                const { nwkHeader, nwkPayload } = await captureRejoinResponse(encodeMACCapabilities(baseCapabilities), { security: false });
+
+                expect(nwkPayload.readUInt8(3)).toStrictEqual(MACAssociationStatus.PAN_ACCESS_DENIED);
+                expect(nwkHeader.destination64).toStrictEqual(rejoiner64);
+            });
         });
 
         it("updates the neighbor relationship based on the MAC-origin information", async () => {

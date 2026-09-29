@@ -1678,7 +1678,9 @@ export class NWKHandler {
             deny,
         );
 
-        await this.sendRejoinResp(nwkHeader.source16!, newAddress16, status);
+        // the requestor checks the destination IEEE address field (#3.6.1.6.1.2), and `newAddress16` is not mapped to it
+        // when the rejoin is denied (0xffff) or answered with a conflict status (a fresh address)
+        await this.sendRejoinResp(nwkHeader.source16!, newAddress16, status, source64);
 
         // XXX: is this spec?
         if (status === MACAssociationStatus.SUCCESS && requiresTransportKey && source64 !== undefined) {
