@@ -872,6 +872,7 @@ export class NWKHandler {
      * @param nwkDest16 Destination network address
      * @param nwkDest64 Optional destination IEEE address (for concentrator routing)
      * @param nwkRadius Initial radius/TTL
+     * @param indirectFirst Put the frame at the front of the destination's indirect queue, if it has one
      * @returns True if success sending (or indirect transmission)
      */
     public async sendCommand(
@@ -882,6 +883,7 @@ export class NWKHandler {
         nwkDest16: number,
         nwkDest64: bigint | undefined,
         nwkRadius: number,
+        indirectFirst = false,
     ): Promise<boolean> {
         let nwkSecurityHeader: ZigbeeSecurityHeader | undefined;
 
@@ -978,7 +980,7 @@ export class NWKHandler {
             nwkFrame,
         );
 
-        const result = await this.#macHandler.sendFrame(macSeqNum, macFrame, macDest16, undefined);
+        const result = await this.#macHandler.sendFrame(macSeqNum, macFrame, macDest16, undefined, indirectFirst);
 
         return result !== false;
     }
@@ -1324,7 +1326,6 @@ export class NWKHandler {
      * - ❌ NOT IMPLEMENTED: TLV processing (R23)
      * - ✅ Resolves an address conflict on an end device child with an unsolicited REJOIN_RESP carrying a new address (#3.6.1.10.5)
      * - ✅ Leaves a conflict on a router to the router, and one on another parent's end device to that parent (#3.6.1.10.5)
-     * - ⚠️  A sleepy child's REJOIN_RESP joins the back of its indirect queue; the spec gives it precedence over other queued frames
      * DEVICE SCOPE: Coordinator, routers (N/A), end devices (N/A)
      *
      * IMPACT: Receives status but minimal action beyond route marking
@@ -1392,6 +1393,7 @@ export class NWKHandler {
      * - ✅ Acts only for an end device child of the coordinator; a router changes its own address, another parent its own child's
      * - ✅ Addresses the response by the child's IEEE address: both holders of the address receive at `address16` (#3.6.1.6.1.2)
      * - ✅ Answers one conflict once: every router that sees it reports it, and each report would otherwise renumber the child again
+     * - ✅ A sleepy child's REJOIN_RESP goes to the front of its indirect queue, ahead of any other queued frame
      * DEVICE SCOPE: Coordinator, routers (N/A)
      *
      * @param address16 The conflicting address
@@ -1423,7 +1425,9 @@ export class NWKHandler {
             expiresAt: now + ZigbeeConsts.MAC_INDIRECT_TRANSMISSION_TIMEOUT,
         });
 
-        await this.sendRejoinResp(address16, newAddress16, ZigbeeNWKConsts.ASSOC_STATUS_ADDR_CONFLICT, device64);
+        // a sleepy child gets it "upon receiving the next keepalive message, and this message SHALL take precedence
+        // over any other network or application layer message"
+        await this.sendRejoinResp(address16, newAddress16, ZigbeeNWKConsts.ASSOC_STATUS_ADDR_CONFLICT, device64, true);
 
         return true;
     }
@@ -1747,6 +1751,7 @@ export class NWKHandler {
      * @param newAddress16 Assigned network address
      * @param status Rejoin status (MACAssociationStatus or NWK status)
      * @param requestSource64 Requestor IEEE address, for the NWK header; looked up from `newAddress16` when omitted
+     * @param unsolicited True for the unsolicited response of an address conflict, which a sleepy child gets before any other queued frame
      * @returns True if success sending (or indirect transmission)
      */
     public async sendRejoinResp(
@@ -1754,6 +1759,7 @@ export class NWKHandler {
         newAddress16: number,
         status: MACAssociationStatus | number,
         requestSource64?: bigint,
+        unsolicited = false,
     ): Promise<boolean> {
         logger.debug(() => `===> NWK REJOIN_RESP[reqSrc16=${requestSource16} newAddr16=${newAddress16} status=${status}]`, NS);
 
@@ -1767,6 +1773,7 @@ export class NWKHandler {
             requestSource16, // nwkDest16
             requestSource64 ?? this.#context.address16ToAddress64.get(newAddress16), // nwkDest64
             CONFIG_NWK_MAX_HOPS, // nwkRadius
+            unsolicited, // indirectFirst
         );
     }
 

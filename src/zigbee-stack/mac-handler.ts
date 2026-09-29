@@ -143,6 +143,7 @@ export class MACHandler {
      * SPEC COMPLIANCE NOTES (IEEE 802.15.4-2015 #6.7.3 / #6.3.4):
      * - ✅ Detects non-RX-on-when-idle children and queues frames for indirect transmission (spec #6.7.3.1)
      * - ✅ Uses MLME data queue semantics (first-in-first-out) when storing in indirectTransmissions
+     * - ✅ Lets a caller put a frame that must take precedence at the front of the queue instead
      * - ✅ Falls back to direct transmission when destination capabilities unknown, satisfying spec SHALL clauses
      * - ⚠️  Queue pruning relies on DATA_REQUEST processing (see processDataReq) to enforce macTransactionPersistenceTime
      * - ⚠️  Does not expose queue depth upper bound; relies on higher layers to avoid overflow
@@ -152,9 +153,16 @@ export class MACHandler {
      * @param payload MAC frame payload
      * @param dest16 Destination 16-bit address
      * @param dest64 Destination 64-bit address
+     * @param indirectFirst Put the frame at the front of an indirect queue rather than at the back
      * @returns True if success sending, undefined if set for indirect transmission
      */
-    public async sendFrame(seqNum: number, payload: Buffer, dest16: number | undefined, dest64: bigint | undefined): Promise<boolean | undefined> {
+    public async sendFrame(
+        seqNum: number,
+        payload: Buffer,
+        dest16: number | undefined,
+        dest64: bigint | undefined,
+        indirectFirst = false,
+    ): Promise<boolean | undefined> {
         if (dest16 !== undefined || dest64 !== undefined) {
             if (dest64 === undefined && dest16 !== undefined) {
                 dest64 = this.#context.address16ToAddress64.get(dest16);
@@ -164,10 +172,16 @@ export class MACHandler {
                 const addrTXs = this.#context.indirectTransmissions.get(dest64);
 
                 if (addrTXs) {
-                    addrTXs.push({
+                    const tx = {
                         sendFrame: this.sendFrameDirect.bind(this, seqNum, payload, dest16, dest64),
                         timestamp: Date.now(),
-                    });
+                    };
+
+                    if (indirectFirst) {
+                        addrTXs.unshift(tx);
+                    } else {
+                        addrTXs.push(tx);
+                    }
 
                     logger.debug(
                         () => `=|=> MAC[seqNum=${seqNum} dst=${dest16}:${dest64}] set for indirect transmission (count=${addrTXs.length})`,

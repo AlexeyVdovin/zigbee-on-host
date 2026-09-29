@@ -3272,14 +3272,14 @@ describe("OT RCP Driver", () => {
 
             expect(findBestSourceRouteSpy).toHaveBeenLastCalledWith(0x96ba, 9244571720527165811n);
             expect(findBestSourceRouteSpy).toHaveLastReturnedWith([undefined, undefined, 1]);
-            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0x96ba, undefined);
+            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0x96ba, undefined, false);
 
             sendFrameSpy.mockResolvedValueOnce(true);
             await driver.nwkHandler.sendStatus(0x6887, ZigbeeNWKStatus.SOURCE_ROUTE_FAILURE);
 
             expect(findBestSourceRouteSpy).toHaveBeenLastCalledWith(0x6887, 5149013643361676n);
             expect(findBestSourceRouteSpy).toHaveLastReturnedWith([0, [0x96ba], 2]);
-            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0x96ba, undefined);
+            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0x96ba, undefined, false);
 
             //-- APS CMD
             sendFrameSpy.mockResolvedValueOnce(true);
@@ -3317,7 +3317,7 @@ describe("OT RCP Driver", () => {
 
             expect(findBestSourceRouteSpy).toHaveBeenLastCalledWith(0xcb47, 5149013569626593n);
             expect(findBestSourceRouteSpy).toHaveLastReturnedWith([undefined, undefined, undefined]);
-            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0xcb47, undefined);
+            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0xcb47, undefined, false);
 
             //-- no source route on source route (doesn't matter)
             sendFrameSpy.mockResolvedValueOnce(true);
@@ -3325,7 +3325,7 @@ describe("OT RCP Driver", () => {
 
             expect(findBestSourceRouteSpy).toHaveBeenLastCalledWith(0x4b8e, 5149013573816379n);
             expect(findBestSourceRouteSpy).toHaveLastReturnedWith([0, [0xcb47], 2]);
-            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0xcb47, undefined);
+            expect(sendFrameSpy).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0xcb47, undefined, false);
 
             //-- no duplication of existing entries
             driver.parser._transform(makeSpinelStreamRaw(1, NET4_ROUTE_RECORD_FROM_4B8E_RELAY_CB47), "utf8", () => {});

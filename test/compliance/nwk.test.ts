@@ -1780,6 +1780,33 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
                 expect(mockMACHandlerCallbacks.onSendFrame).not.toHaveBeenCalled();
                 expect(context.address16ToAddress64.get(conflict16)).toStrictEqual(device64);
             });
+
+            it("gives a sleepy child the response on its next poll, ahead of frames already queued for it", async () => {
+                registerDevice(context, conflict16, device64, true, capabilities(ZigbeeMACConsts.DEVICE_TYPE_RFD));
+                context.indirectTransmissions.set(device64, []);
+                mockMACHandlerCallbacks.onSendFrame = vi.fn(() => Promise.resolve());
+
+                await nwkHandler.sendEdTimeoutResponse(conflict16, 4);
+                await processNetworkStatus(ZigbeeNWKStatus.ADDRESS_CONFLICT, conflict16);
+
+                expect(mockMACHandlerCallbacks.onSendFrame).not.toHaveBeenCalled();
+                expect(context.indirectTransmissions.get(device64)).toHaveLength(2);
+
+                const poll: MACHeader = {
+                    frameControl: createMACFrameControl(MACFrameType.CMD, MACFrameAddressMode.SHORT, MACFrameAddressMode.SHORT),
+                    sequenceNumber: 0x26,
+                    destinationPANId: netParams.panId,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: conflict16,
+                    commandId: undefined,
+                    fcs: 0,
+                };
+                const macFrame = await captureMacFrame(() => macHandler.processDataReq(Buffer.alloc(0), 0, poll), mockMACHandlerCallbacks);
+                const { nwkPayload } = decodeNWKFromMacFrame(macFrame, true);
+
+                expect(nwkPayload.readUInt8(0)).toStrictEqual(ZigbeeNWKCommandId.REJOIN_RESP);
+                expect(context.indirectTransmissions.get(device64)).toHaveLength(1);
+            });
         });
 
         it.each([
