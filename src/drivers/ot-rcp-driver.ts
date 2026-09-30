@@ -109,6 +109,7 @@ export class OTRCPDriver {
 
         const contextCallbacks: StackContextCallbacks = {
             onDeviceLeft: callbacks.onDeviceLeft,
+            onDeviceRejoined: callbacks.onDeviceRejoined,
         };
 
         this.context = new StackContext(contextCallbacks, join(saveDir, "zoh.save"), netParams);
