@@ -434,6 +434,223 @@ describe("NWK Handler", () => {
         });
     });
 
+    describe("Targeted route discovery", () => {
+        const child16 = 0x268f;
+        const child64 = 0x00124b00aabb0001n;
+        const parent16 = 0x661e;
+        let requestSpy: MockInstance<NWKHandler["sendRouteReq"]>;
+
+        function addChild(neighbor: boolean): void {
+            mockContext.deviceTable.set(child64, {
+                address16: child16,
+                capabilities: {
+                    alternatePANCoordinator: false,
+                    deviceType: 0,
+                    powerSource: 0,
+                    rxOnWhenIdle: false,
+                    securityCapability: true,
+                    allocateAddress: true,
+                },
+                authorized: true,
+                neighbor,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+            mockContext.address16ToAddress64.set(child16, child64);
+        }
+
+        beforeEach(() => {
+            vi.useFakeTimers();
+            vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+            requestSpy = vi.spyOn(nwkHandler, "sendRouteReq").mockResolvedValue(true);
+        });
+
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        it("asks for a route to a device that is not a neighbour and has none", () => {
+            addChild(false);
+
+            const [relayIndex, relays] = nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+
+            expect(relayIndex).toBeUndefined();
+            expect(relays).toBeUndefined();
+            // many-to-one disabled (0), for the device's own address
+            expect(requestSpy).toHaveBeenCalledTimes(1);
+            expect(requestSpy).toHaveBeenCalledWith(0, child16);
+        });
+
+        it("asks again when every route to it has expired", () => {
+            addChild(false);
+            const expired = nwkHandler.createSourceRouteEntry([parent16], 2);
+            expired.lastUpdated = Date.now() - 310000;
+            mockContext.sourceRouteTable.set(child16, [expired]);
+
+            nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+
+            expect(requestSpy).toHaveBeenCalledTimes(1);
+            expect(requestSpy).toHaveBeenCalledWith(0, child16);
+        });
+
+        it("asks again when every route to it is blacklisted", () => {
+            addChild(false);
+            const failing = nwkHandler.createSourceRouteEntry([parent16], 2);
+            failing.failureCount = 3;
+            mockContext.sourceRouteTable.set(child16, [failing]);
+
+            nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+
+            expect(requestSpy).toHaveBeenCalledTimes(1);
+            expect(requestSpy).toHaveBeenCalledWith(0, child16);
+        });
+
+        it("asks at most once per nwkcRouteDiscoveryTime for one device", () => {
+            addChild(false);
+
+            nwkHandler.findBestSourceRoute(child16, child64);
+            nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+            expect(requestSpy).toHaveBeenCalledTimes(1);
+
+            vi.advanceTimersByTime(9000);
+            nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+            expect(requestSpy).toHaveBeenCalledTimes(1);
+
+            vi.advanceTimersByTime(1000);
+            nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+            expect(requestSpy).toHaveBeenCalledTimes(2);
+        });
+
+        it("does not ask for a route to a neighbour", () => {
+            addChild(true);
+
+            nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+
+            expect(requestSpy).not.toHaveBeenCalled();
+        });
+
+        it("does not ask while a usable route exists", () => {
+            addChild(false);
+            mockContext.sourceRouteTable.set(child16, [nwkHandler.createSourceRouteEntry([parent16], 2)]);
+
+            const [relayIndex, relays] = nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+
+            expect(relayIndex).toStrictEqual(0);
+            expect(relays).toStrictEqual([parent16]);
+            expect(requestSpy).not.toHaveBeenCalled();
+        });
+
+        it("stores a route reply sent on a child's behalf as a source route through its parent", () => {
+            addChild(false);
+            const payload = Buffer.from([
+                ZigbeeNWKCommandId.ROUTE_REPLY,
+                0x00, // options
+                0x21, // route request id
+                ZigbeeConsts.COORDINATOR_ADDRESS & 0xff,
+                (ZigbeeConsts.COORDINATOR_ADDRESS >> 8) & 0xff,
+                child16 & 0xff, // responder: the child, answered for by its parent
+                (child16 >> 8) & 0xff,
+                0x02, // path cost
+            ]);
+
+            nwkHandler.processRouteReply(
+                payload,
+                1,
+                { frameControl: {}, source16: parent16, sequenceNumber: 30 } as MACHeader,
+                {
+                    frameControl: {},
+                    source16: parent16,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    relayAddresses: undefined,
+                    seqNum: 31,
+                } as ZigbeeNWKHeader,
+            );
+
+            const [relayIndex, relays] = nwkHandler.findBestSourceRoute(child16, child64);
+            vi.runAllTimers();
+
+            expect(relayIndex).toStrictEqual(0);
+            expect(relays).toStrictEqual([parent16]);
+            expect(requestSpy).not.toHaveBeenCalled();
+        });
+
+        it("does not answer a route request that comes back from the coordinator itself", async () => {
+            const routeRequest = Buffer.from([
+                ZigbeeNWKCommandId.ROUTE_REQ,
+                0x00, // options: not many-to-one
+                10, // id
+                0x78,
+                0x56, // destination16, a unicast address
+                0, // pathCost
+            ]);
+            const headersFrom = (nwkSource16: number, macSource16: number): [MACHeader, ZigbeeNWKHeader] => [
+                {
+                    frameControl: {
+                        frameType: 1,
+                        securityEnabled: false,
+                        framePending: false,
+                        ackRequest: true,
+                        panIdCompression: true,
+                        seqNumSuppress: false,
+                        iePresent: false,
+                        destAddrMode: 2,
+                        frameVersion: 0,
+                        sourceAddrMode: 2,
+                    },
+                    sequenceNumber: 1,
+                    destinationPANId: 0x1a62,
+                    destination16: ZigbeeConsts.BCAST_DEFAULT,
+                    source16: macSource16,
+                    fcs: 0,
+                },
+                {
+                    frameControl: {
+                        frameType: 1,
+                        protocolVersion: 2,
+                        discoverRoute: 0,
+                        multicast: false,
+                        security: false,
+                        sourceRoute: false,
+                        extendedDestination: false,
+                        extendedSource: false,
+                        endDeviceInitiator: false,
+                    },
+                    destination16: ZigbeeConsts.BCAST_DEFAULT,
+                    source16: nwkSource16,
+                    radius: 10,
+                    seqNum: 5,
+                },
+            ];
+            mockContext.address16ToAddress64.set(0x1234, 0x00124b0012345678n);
+            // the router that repeats our broadcast is a known device: a reply to it could be sent
+            mockContext.address16ToAddress64.set(parent16, 0x00124b00aabb0002n);
+            sendFrameSpy.mockClear();
+
+            // a router repeats our broadcast: the NWK source stays the coordinator, the MAC source is the router
+            const [echoMac, echoNwk] = headersFrom(ZigbeeConsts.COORDINATOR_ADDRESS, parent16);
+            await nwkHandler.processCommand(routeRequest, echoMac, echoNwk);
+
+            expect(sendFrameSpy).not.toHaveBeenCalled();
+
+            // the same request from a router is answered, so the check above is not vacuous
+            const [routerMac, routerNwk] = headersFrom(0x1234, 0x1234);
+            await nwkHandler.processCommand(routeRequest, routerMac, routerNwk);
+
+            expect(sendFrameSpy).toHaveBeenCalled();
+        });
+    });
+
     describe("NWK Command Sending", () => {
         it("should send route request command", async () => {
             const result = await nwkHandler.sendRouteReq(0, 0x1234, 0x00124b0012345678n);

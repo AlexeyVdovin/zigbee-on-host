@@ -3344,7 +3344,9 @@ describe("OT RCP Driver", () => {
             expect(driver.nwkHandler.findBestSourceRoute(0x4b8e, undefined)).toStrictEqual([undefined, undefined, undefined]);
             await vi.advanceTimersByTimeAsync(10); // flush
             expect(sendPeriodicManyToOneRouteRequestSpy).toHaveBeenCalledTimes(1);
-            expect(sendRouteReqSpy).toHaveBeenCalledTimes(1);
+            // the many-to-one request, and beside it a request for the destination itself (many-to-one disabled)
+            expect(sendRouteReqSpy).toHaveBeenCalledTimes(2);
+            expect(sendRouteReqSpy).toHaveBeenCalledWith(0, 0x4b8e);
 
             //-- too many NO_ACK
             driver.context.sourceRouteTable.set(0x6887, [
@@ -3359,7 +3361,8 @@ describe("OT RCP Driver", () => {
             expect(driver.nwkHandler.findBestSourceRoute(0x6887, undefined)).toStrictEqual([2, [0x6, 0x7, 0x8], 4]);
             await vi.advanceTimersByTimeAsync(10); // flush
             expect(sendPeriodicManyToOneRouteRequestSpy).toHaveBeenCalledTimes(1);
-            expect(sendRouteReqSpy).toHaveBeenCalledTimes(1); // too soon
+            // too soon for another many-to-one request, and the route found needs no request for the destination
+            expect(sendRouteReqSpy).toHaveBeenCalledTimes(2);
             const remaining = driver.context.sourceRouteTable.get(0x6887)!;
             expect(remaining).toHaveLength(1);
             expect(remaining[0].relayAddresses).toStrictEqual([0x6, 0x7, 0x8]);
@@ -3373,7 +3376,9 @@ describe("OT RCP Driver", () => {
             await vi.advanceTimersByTimeAsync(10); // flush
             // MTORR called once more when no valid routes remain for non-neighbor
             expect(sendPeriodicManyToOneRouteRequestSpy).toHaveBeenCalledTimes(2);
-            expect(sendRouteReqSpy).toHaveBeenCalledTimes(2);
+            // two more: the many-to-one request, and one for 0x6887 itself (many-to-one disabled)
+            expect(sendRouteReqSpy).toHaveBeenCalledTimes(4);
+            expect(sendRouteReqSpy).toHaveBeenCalledWith(0, 0x6887);
             expect(driver.context.sourceRouteTable.get(0x6887)).toBeUndefined();
 
             //--- received LINK_STATUS indicating direct link to coordinator available
@@ -3536,7 +3541,9 @@ describe("OT RCP Driver", () => {
             await vi.advanceTimersByTimeAsync(10); // flush
 
             expect(sendPeriodicManyToOneRouteRequestSpy).toHaveBeenCalledTimes(2); // processStatus + findBestSourceRoute
-            expect(sendRouteReqSpy).toHaveBeenCalledTimes(1);
+            // the many-to-one request, and beside it a request for the destination itself (many-to-one disabled)
+            expect(sendRouteReqSpy).toHaveBeenCalledTimes(2);
+            expect(sendRouteReqSpy).toHaveBeenCalledWith(0, 0x9ed5);
         });
 
         it("gets routing table", async () => {

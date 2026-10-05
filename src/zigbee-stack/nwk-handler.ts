@@ -74,6 +74,8 @@ const CONFIG_NWK_ROUTE_EXPIRY_TIME = 300000;
 const CONFIG_NWK_ROUTE_MAX_FAILURES = 3;
 /** Minimum time between many-to-one route request broadcasts to avoid flooding (msec) */
 const CONFIG_NWK_CONCENTRATOR_MIN_TIME = 10000;
+/** 05-3474-23 nwkcRouteDiscoveryTime, 0x2710 msec on 2.4GHz: the least spacing of targeted route requests for one destination */
+const CONFIG_NWK_ROUTE_REQUEST_MIN_TIME = 10000;
 /** The maximum number of hops in a source route. */
 const CONFIG_NWK_MAX_SOURCE_ROUTE = 0x0c;
 /** nwkcMaxBroadcastJitter: the maximum broadcast jitter time (msec) */
@@ -109,11 +111,57 @@ export class NWKHandler {
     readonly #pendingConflictReports = new Map<number, { timeout: NodeJS.Timeout; holders64: bigint[] }>();
     /** Time of last many-to-one route request */
     #lastMTORRTime = 0;
+    /**
+     * Time of the last targeted route request, by destination address.
+     * Never pruned: one entry per destination ever asked about, so bounded by the size of the network.
+     */
+    #lastRouteRequestTo = new Map<number, number>();
 
     constructor(context: StackContext, macHandler: MACHandler, callbacks: NWKHandlerCallbacks) {
         this.#context = context;
         this.#macHandler = macHandler;
         this.#callbacks = callbacks;
+    }
+
+    /**
+     * 05-3474-23 #3.6.4.3 (Upon Receipt of a Unicast Frame), #3.6.4.5.1.2 (Route Request Forwarding), #3.6.4.8.2 (Route Repair Functionality)
+     *
+     * No source route to a device that is not a neighbour: ask for one.
+     *
+     * Without a route the spec has the originator "initiate route discovery" for the destination (#3.6.4.3). It has
+     * no frame sent to the destination's own address, which only a neighbour can hear. A router answers a route
+     * request for one of its end device children on the child's behalf (#3.6.4.5.1.2), so a sleeping child need not
+     * be awake to be found, and `processRouteReply` stores the answer as a source route through that router.
+     *
+     * The many-to-one request sent beside this one names no destination: a parent answers it with route records
+     * only for the children that transmit by themselves, and a sleeping child may not for hours.
+     *
+     * SPEC COMPLIANCE NOTES:
+     * - OK: route request for the destination's 16-bit address, many-to-one disabled (#3.4.1)
+     * - OK: at most one per destination per nwkcRouteDiscoveryTime
+     * - NOTE: no routing table entry and no buffering of the frame; the APS retry finds the route the answer brings
+     * - NOTE: the discover route sub-field of the frame being sent is not looked at. #3.6.4.3 has discovery only for 0x01, and ROUTE_ERROR for 0.
+     *   `findBestSourceRoute` does not see the sub-field, so this also runs for frames sent with SUPPRESS, every coordinator ZDO response
+     *   included. More lenient than the spec for a coordinator that originates the frame, and harmless in practice
+     * DEVICE SCOPE: Coordinator, routers (N/A)
+     *
+     * @param destination16 Network address of the device a route is needed to
+     */
+    #requestRouteTo(destination16: number): void {
+        const now = Date.now();
+        const last = this.#lastRouteRequestTo.get(destination16);
+
+        if (last !== undefined && now - last < CONFIG_NWK_ROUTE_REQUEST_MIN_TIME) {
+            return;
+        }
+
+        this.#lastRouteRequestTo.set(destination16, now);
+
+        setImmediate(() => {
+            this.sendRouteReq(ZigbeeNWKManyToOne.DISABLED, destination16).catch((error: Error) => {
+                logger.debug(() => `=x=> NWK ROUTE_REQ[dst=${destination16}] ${error.message}`, NS);
+            });
+        });
     }
 
     async start() {
@@ -526,7 +574,8 @@ export class NWKHandler {
                 // force immediate MTORR
                 logger.warning(`No known route to ${destination16}:${destination64}, forcing discovery`, NS);
                 setImmediate(this.sendPeriodicManyToOneRouteRequest.bind(this));
-                // will send direct as "last resort"
+                this.#requestRouteTo(destination16);
+                // the frame still goes direct as a "last resort"; the retry finds the route this request brings back
             }
 
             return [undefined, undefined, undefined];
@@ -556,6 +605,7 @@ export class NWKHandler {
 
             if (device && !device.neighbor) {
                 logger.warning(`All routes to ${destination16}:${destination64} invalid, forcing discovery`, NS);
+                this.#requestRouteTo(destination16);
                 setImmediate(this.sendPeriodicManyToOneRouteRequest.bind(this));
             }
 
@@ -1126,7 +1176,9 @@ export class NWKHandler {
             NS,
         );
 
-        if (destination16 < ZigbeeConsts.BCAST_MIN) {
+        // never answer our own request. A copy of it that comes back with a broadcast MAC destination is dropped before this point
+        // (frame.ts, "broadcast loopback"); this covers one that would come back with a unicast MAC destination
+        if (destination16 < ZigbeeConsts.BCAST_MIN && nwkHeader.source16 !== ZigbeeConsts.COORDINATOR_ADDRESS) {
             await this.sendRouteReply(
                 // the first hop back to the originator is the neighbour this request arrived from.
                 // a route request is broadcast, so `macHeader.destination16` is BCAST_DEFAULT here,
