@@ -411,11 +411,7 @@ export class APSHandler {
             return await this.#sendFragmentedData(params, apsCounter);
         }
 
-        const sendDest16 = await this.#sendDataInternal(params, apsCounter, 0);
-
-        if (sendDest16 !== undefined) {
-            this.#trackPendingAck(sendDest16, apsCounter, params);
-        }
+        await this.#sendDataInternal(params, apsCounter, 0, {});
 
         return apsCounter;
     }
@@ -437,9 +433,15 @@ export class APSHandler {
      * @param params
      * @param apsCounter
      * @param attempt
+     * @param track If given, start waiting for the APS ACK of a unicast before the MAC send, with this fragment context
      * @returns Destination short address (undefined for broadcast)
      */
-    async #sendDataInternal(params: SendDataParams, apsCounter: number, attempt: number): Promise<number | undefined> {
+    async #sendDataInternal(
+        params: SendDataParams,
+        apsCounter: number,
+        attempt: number,
+        track?: { fragment?: OutgoingFragmentContext },
+    ): Promise<number | undefined> {
         const { finalPayload, nwkDiscoverRoute, apsDeliveryMode, clusterId, profileId, destEndpoint, sourceEndpoint, group } = params;
         let { nwkDest16, nwkDest64 } = params;
         const nwkSeqNum = this.#nwkHandler.nextSeqNum();
@@ -583,9 +585,22 @@ export class APSHandler {
             nwkFrame,
         );
 
+        // Wait for the APS ACK before the MAC send, not after it: the destination answers as soon as it has the frame,
+        // and its ACK can be processed before the MAC confirmation resolves `sendFrame`. An ACK with no pending entry is
+        // dropped, and the frame is then retried although it was delivered.
+        const tracked = track !== undefined && macDest16 !== ZigbeeMACConsts.BCAST_ADDR;
+
+        if (tracked) {
+            this.#trackPendingAck(nwkDest16, apsCounter, params, track.fragment);
+        }
+
         const result = await this.#macHandler.sendFrame(macSeqNum, macFrame, macDest16, undefined);
 
         if (result === false) {
+            if (tracked) {
+                this.#untrackPendingAck(nwkDest16, apsCounter);
+            }
+
             logger.error(
                 `=x=> APS DATA[seqNum=(${apsCounter}/${nwkSeqNum}/${macSeqNum}) attempt=${attempt} macDst16=${macDest16} nwkDst=${nwkDest16}:${nwkDest64}] Failed to send`,
                 NS,
@@ -653,13 +668,11 @@ export class APSHandler {
             totalBlocks: chunks.length,
         };
 
-        const { dest16, params: firstParams } = await this.#sendFragmentBlock(context, apsCounter, 0, 0);
+        const dest16 = await this.#sendFragmentBlock(context, apsCounter, 0, 0);
 
         if (dest16 === undefined) {
             throw new Error("APS fragmentation requires unicast destination acknowledgments");
         }
-
-        this.#trackPendingAck(dest16, apsCounter, firstParams, context);
 
         return apsCounter;
     }
@@ -683,11 +696,10 @@ export class APSHandler {
         apsCounter: number,
         blockNumber: number,
         attempt: number,
-    ): Promise<{ dest16: number | undefined; params: SendDataParams }> {
+    ): Promise<number | undefined> {
         const fragmentParams = this.#buildFragmentParams(context, blockNumber);
-        const dest16 = await this.#sendDataInternal(fragmentParams, apsCounter, attempt);
 
-        return { dest16, params: fragmentParams };
+        return await this.#sendDataInternal(fragmentParams, apsCounter, attempt, { fragment: context });
     }
 
     /**
@@ -706,13 +718,11 @@ export class APSHandler {
             return;
         }
 
-        const { dest16, params } = await this.#sendFragmentBlock(context, previousEntry.apsCounter, context.awaitingBlock, 0);
+        const dest16 = await this.#sendFragmentBlock(context, previousEntry.apsCounter, context.awaitingBlock, 0);
 
         if (dest16 === undefined) {
             throw new Error("APS fragmentation requires unicast destination acknowledgments");
         }
-
-        this.#trackPendingAck(dest16, previousEntry.apsCounter, params, context);
     }
 
     /**
@@ -857,6 +867,24 @@ export class APSHandler {
             }, CONFIG_APS_ACK_WAIT_DURATION_MS),
             fragment,
         });
+    }
+
+    /**
+     * Stop waiting for an APS ACK, for a frame that was never sent.
+     */
+    #untrackPendingAck(dest16: number, apsCounter: number): void {
+        const key = `${dest16}:${apsCounter}`;
+        const entry = this.#pendingAcks.get(key);
+
+        if (entry === undefined) {
+            return;
+        }
+
+        if (entry.timer !== undefined) {
+            clearTimeout(entry.timer);
+        }
+
+        this.#pendingAcks.delete(key);
     }
 
     /**

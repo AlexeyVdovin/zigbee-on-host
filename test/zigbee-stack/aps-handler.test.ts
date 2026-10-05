@@ -2280,6 +2280,155 @@ describe("APS Handler", () => {
         vi.useRealTimers();
     });
 
+    describe("APS ACK arriving before the MAC confirmation", () => {
+        const dest16 = 0x7005;
+        const dest64 = 0x00124b0000007005n;
+
+        beforeEach(() => {
+            mockContext.deviceTable.set(dest64, {
+                address16: dest16,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: true,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+            mockContext.address16ToAddress64.set(dest16, dest64);
+            vi.useFakeTimers();
+        });
+
+        afterEach(() => {
+            vi.clearAllTimers();
+            vi.useRealTimers();
+        });
+
+        const lastCounter = (): number => (apsHandler.nextCounter as Mock).mock.results.at(-1)!.value as number;
+
+        const ackFrom = async (counter: number): Promise<void> => {
+            const macHeader = { frameControl: {}, source16: dest16, destination16: ZigbeeConsts.COORDINATOR_ADDRESS } as MACHeader;
+            const nwkHeader = {
+                frameControl: {},
+                source16: dest16,
+                destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                seqNum: 0x46,
+            } as ZigbeeNWKHeader;
+            const apsHeader = {
+                frameControl: {
+                    frameType: ZigbeeAPSFrameType.ACK,
+                    deliveryMode: ZigbeeAPSDeliveryMode.UNICAST,
+                    ackFormat: false,
+                    security: false,
+                    ackRequest: false,
+                    extendedHeader: false,
+                },
+                counter,
+            } as ZigbeeAPSHeader;
+
+            await apsHandler.processFrame(Buffer.alloc(0), macHeader, nwkHeader, apsHeader, 180);
+        };
+
+        /** Hold the next MAC send open until the returned function confirms it. */
+        const holdNextSend = (): ((ok: boolean) => void) => {
+            let confirm: (ok: boolean) => void = () => {};
+
+            (mockMACHandler.sendFrame as Mock).mockImplementationOnce(
+                () =>
+                    new Promise<boolean>((resolve) => {
+                        confirm = resolve;
+                    }),
+            );
+
+            return (ok) => confirm(ok);
+        };
+
+        it("accepts the ACK and does not retry the frame", async () => {
+            const sendFrameMock = mockMACHandler.sendFrame as Mock;
+            sendFrameMock.mockClear();
+            const confirm = holdNextSend();
+
+            const sending = apsHandler.sendData(
+                Buffer.from([0xcc]),
+                ZigbeeNWKRouteDiscovery.SUPPRESS,
+                dest16,
+                dest64,
+                ZigbeeAPSDeliveryMode.UNICAST,
+                0x0006,
+                0x0104,
+                0x01,
+                0x01,
+                undefined,
+            );
+
+            expect(sendFrameMock).toHaveBeenCalledTimes(1);
+
+            // the destination answers before the radio reports the MAC ACK
+            await ackFrom(lastCounter());
+            confirm(true);
+            await sending;
+
+            await vi.advanceTimersByTimeAsync(CONFIG_APS_ACK_WAIT_DURATION_MS * 5);
+
+            expect(sendFrameMock).toHaveBeenCalledTimes(1);
+        });
+
+        it("advances a fragmented send on the ACK of its first block", async () => {
+            const sendFrameMock = mockMACHandler.sendFrame as Mock;
+            sendFrameMock.mockClear();
+            const confirm = holdNextSend();
+
+            const sending = apsHandler.sendData(
+                Buffer.alloc(ZigbeeAPSConsts.PAYLOAD_MAX_SIZE + 8, 0xcd),
+                ZigbeeNWKRouteDiscovery.SUPPRESS,
+                dest16,
+                dest64,
+                ZigbeeAPSDeliveryMode.UNICAST,
+                0x0006,
+                0x0104,
+                0x01,
+                0x01,
+                undefined,
+            );
+
+            expect(sendFrameMock).toHaveBeenCalledTimes(1);
+
+            await ackFrom(lastCounter());
+            confirm(true);
+            await sending;
+            await vi.advanceTimersByTimeAsync(0);
+
+            // block 1 went out on the ACK of block 0, and block 0 was not sent again
+            expect(sendFrameMock).toHaveBeenCalledTimes(2);
+        });
+
+        it("stops waiting for an ACK when the MAC send fails", async () => {
+            const sendFrameMock = mockMACHandler.sendFrame as Mock;
+            sendFrameMock.mockClear();
+            sendFrameMock.mockResolvedValueOnce(false);
+
+            await expect(
+                apsHandler.sendData(
+                    Buffer.from([0xdd]),
+                    ZigbeeNWKRouteDiscovery.SUPPRESS,
+                    dest16,
+                    dest64,
+                    ZigbeeAPSDeliveryMode.UNICAST,
+                    0x0006,
+                    0x0104,
+                    0x01,
+                    0x01,
+                    undefined,
+                ),
+            ).rejects.toThrow("Failed to send");
+
+            await vi.advanceTimersByTimeAsync(CONFIG_APS_ACK_WAIT_DURATION_MS * 5);
+
+            expect(sendFrameMock).toHaveBeenCalledTimes(1);
+        });
+    });
+
     it("ignores APS ACKs when IEEE mapping is unavailable", async () => {
         const sendFrameMock = mockMACHandler.sendFrame as Mock;
         sendFrameMock.mockClear();
