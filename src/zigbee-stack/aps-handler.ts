@@ -21,6 +21,7 @@ import {
     ZigbeeAPSUpdateDeviceStatus,
 } from "../zigbee/zigbee-aps.js";
 import { encodeZigbeeNWKFrame, ZigbeeNWKConsts, ZigbeeNWKFrameType, type ZigbeeNWKHeader, ZigbeeNWKRouteDiscovery } from "../zigbee/zigbee-nwk.js";
+import { matchCoordinatorEndpoints } from "./descriptors.js";
 import type { MACHandler } from "./mac-handler.js";
 import { CONFIG_NWK_MAX_HOPS, type NWKHandler } from "./nwk-handler.js";
 import { ApplicationKeyRequestPolicy, type StackCallbacks, type StackContext, TrustCenterKeyRequestPolicy } from "./stack-context.js";
@@ -1235,7 +1236,13 @@ export class APSHandler {
 
                         if (isRequest) {
                             if (this.isZDORequestForCoordinator(apsHeader.clusterId!, nwkHeader.destination16, nwkHeader.destination64, data)) {
-                                await this.respondToCoordinatorZDORequest(data, apsHeader.clusterId!, nwkHeader.source16, nwkHeader.source64);
+                                await this.respondToCoordinatorZDORequest(
+                                    data,
+                                    apsHeader.clusterId!,
+                                    nwkHeader.source16,
+                                    nwkHeader.source64,
+                                    nwkHeader.destination16 !== undefined && nwkHeader.destination16 >= ZigbeeConsts.BCAST_MIN,
+                                );
                             }
 
                             // don't emit received ZDO requests
@@ -2883,7 +2890,7 @@ export class APSHandler {
      * @param requestData The request payload buffer
      * @returns Response buffer or undefined if cluster not supported
      */
-    public getCoordinatorZDOResponse(clusterId: number, requestData: Buffer): Buffer | undefined {
+    public getCoordinatorZDOResponse(clusterId: number, requestData: Buffer, broadcastRequest = false): Buffer | undefined {
         switch (clusterId) {
             case ZigbeeConsts.NETWORK_ADDRESS_REQUEST: {
                 // TODO: handle reportKids & index, this payload is only for 0, 0
@@ -2911,7 +2918,88 @@ export class APSHandler {
             case ZigbeeConsts.ROUTING_TABLE_REQUEST: {
                 return this.getRoutingTableResponse(requestData[1 /* 0 is tsn */]);
             }
+            case ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST: {
+                return this.getMatchDescriptorResponse(requestData, broadcastRequest);
+            }
         }
+    }
+
+    /**
+     * 05-3474-23 #2.4.3.1.7.2 (Match_Desc_req, Effect on Receipt), #2.4.4.2.7.1 (Match_Desc_rsp, When Generated)
+     *
+     * Answer a Match_Desc_req with the coordinator's own endpoints that match. An over-the-air upgrade client that has been
+     * told an image is ready (Image Notify) looks for the upgrade server this way, and asks for nothing until it has found one.
+     *
+     * SPEC COMPLIANCE NOTES:
+     * - OK: step 3, the address of interest is the coordinator's or a broadcast: every local Simple Descriptor is matched
+     *   (#2.4.4.2.7.2, in `matchCoordinatorEndpoints`) and an endpoint that matches is listed once
+     * - OK: step 5, no match for a request sent to a broadcast address: no response
+     * - OK: step 7, no match for a request sent to the coordinator: SUCCESS with MatchLength 0
+     * - NOTE: step 4, the address of another device, needs that device's descriptors (a child's, from the neighbour table),
+     *   which zoh does not hold: left unanswered, as every Match_Desc_req was before this
+     * - NOTE: the response carries the coordinator's own address as NWKAddrOfInterest, also for a broadcast request, so that
+     *   the requester can tell who matched; the table says "NWK address for the request" and does not say which it means
+     * DEVICE SCOPE: Coordinator, routers (N/A), end devices (N/A)
+     *
+     * @param requestData The ZDO request payload, transaction sequence number first
+     * @param broadcastRequest Whether the NWK destination of the request was a broadcast address
+     * @returns The response payload (transaction sequence number set on use), or undefined for no response
+     */
+    public getMatchDescriptorResponse(requestData: Buffer, broadcastRequest: boolean): Buffer | undefined {
+        // tsn (1), NWKAddrOfInterest (2), ProfileID (2), NumInClusters (1), InClusterList (2 each), NumOutClusters (1), OutClusterList (2 each)
+        if (requestData.length < 7) {
+            return undefined;
+        }
+
+        const nwkAddrOfInterest = requestData.readUInt16LE(1);
+        const profileId = requestData.readUInt16LE(3);
+        const numInClusters = requestData[5];
+        const numOutClustersAt = 6 + numInClusters * 2;
+
+        if (requestData.length < numOutClustersAt + 1) {
+            return undefined;
+        }
+
+        const numOutClusters = requestData[numOutClustersAt];
+
+        if (requestData.length < numOutClustersAt + 1 + numOutClusters * 2) {
+            return undefined;
+        }
+
+        // step 4 is the address of another device, and needs that device's own descriptors
+        if (nwkAddrOfInterest !== ZigbeeConsts.COORDINATOR_ADDRESS && nwkAddrOfInterest < ZigbeeConsts.BCAST_MIN) {
+            return undefined;
+        }
+
+        const inputClusters: number[] = [];
+        const outputClusters: number[] = [];
+
+        for (let i = 0; i < numInClusters; i++) {
+            inputClusters.push(requestData.readUInt16LE(6 + i * 2));
+        }
+
+        for (let i = 0; i < numOutClusters; i++) {
+            outputClusters.push(requestData.readUInt16LE(numOutClustersAt + 1 + i * 2));
+        }
+
+        const matchList = matchCoordinatorEndpoints(profileId, inputClusters, outputClusters);
+
+        // step 5
+        if (matchList.length === 0 && broadcastRequest) {
+            return undefined;
+        }
+
+        // step 7: tsn (set on use), status, NWKAddrOfInterest, MatchLength, MatchList
+        const response = Buffer.alloc(5 + matchList.length);
+        response.writeUInt8(0x00 /* SUCCESS */, 1);
+        response.writeUInt16LE(ZigbeeConsts.COORDINATOR_ADDRESS, 2);
+        response.writeUInt8(matchList.length, 4);
+
+        for (let i = 0; i < matchList.length; i++) {
+            response.writeUInt8(matchList[i], 5 + i);
+        }
+
+        return response;
     }
 
     /**
@@ -2942,6 +3030,17 @@ export class APSHandler {
                 case ZigbeeConsts.ACTIVE_ENDPOINTS_REQUEST: {
                     return data.readUInt16LE(1 /* skip seq num */) === ZigbeeConsts.COORDINATOR_ADDRESS;
                 }
+
+                case ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST: {
+                    // #2.4.3.1.7.1: a broadcast request carries the broadcast address as the address of interest
+                    if (data.length < 3) {
+                        return false;
+                    }
+
+                    const nwkAddrOfInterest = data.readUInt16LE(1 /* skip seq num */);
+
+                    return nwkAddrOfInterest === ZigbeeConsts.COORDINATOR_ADDRESS || nwkAddrOfInterest >= ZigbeeConsts.BCAST_MIN;
+                }
             }
         }
 
@@ -2954,14 +3053,16 @@ export class APSHandler {
      * @param clusterId ZDO cluster ID
      * @param nwkDest16 Network destination address (16-bit)
      * @param nwkDest64 Network destination address (64-bit)
+     * @param broadcastRequest Whether the request was sent to a broadcast address
      */
     public async respondToCoordinatorZDORequest(
         data: Buffer,
         clusterId: number,
         nwkDest16: number | undefined,
         nwkDest64: bigint | undefined,
+        broadcastRequest = false,
     ): Promise<void> {
-        const finalPayload = this.getCoordinatorZDOResponse(clusterId, data);
+        const finalPayload = this.getCoordinatorZDOResponse(clusterId, data, broadcastRequest);
 
         if (finalPayload) {
             // set the ZDO sequence number in outgoing payload same as incoming request

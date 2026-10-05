@@ -1310,6 +1310,246 @@ describe("APS Handler", () => {
             expect(apsHandler.isZDORequestForCoordinator(ZigbeeConsts.NODE_DESCRIPTOR_REQUEST, 0x1234, undefined, data4)).toStrictEqual(false);
         });
 
+        describe("Match_Desc_req", () => {
+            const Ota = 0x0019;
+            const HaProfile = 0x0104;
+            const GpProfile = 0xa1e0;
+
+            // tsn, NWKAddrOfInterest, ProfileID, NumInClusters, InClusterList, NumOutClusters, OutClusterList
+            function matchDescReq(nwkAddrOfInterest: number, profileId: number, inClusters: number[], outClusters: number[], tsn = 0x2a): Buffer {
+                const buf = Buffer.alloc(1 + 2 + 2 + 1 + inClusters.length * 2 + 1 + outClusters.length * 2);
+                let offset = buf.writeUInt8(tsn, 0);
+                offset = buf.writeUInt16LE(nwkAddrOfInterest, offset);
+                offset = buf.writeUInt16LE(profileId, offset);
+                offset = buf.writeUInt8(inClusters.length, offset);
+
+                for (const cluster of inClusters) {
+                    offset = buf.writeUInt16LE(cluster, offset);
+                }
+
+                offset = buf.writeUInt8(outClusters.length, offset);
+
+                for (const cluster of outClusters) {
+                    offset = buf.writeUInt16LE(cluster, offset);
+                }
+
+                return buf;
+            }
+
+            // response: tsn (set on use), status, NWKAddrOfInterest (the coordinator), MatchLength, MatchList
+            function matchDescRsp(...endpoints: number[]): Buffer {
+                return Buffer.from([0x00, 0x00, 0x00, 0x00, endpoints.length, ...endpoints]);
+            }
+
+            it("answers a broadcast request for the upgrade server cluster with the endpoint that has it", () => {
+                // what an upgrade client sends after Image Notify: one input cluster, no output cluster
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, HaProfile, [Ota], []),
+                    true,
+                );
+
+                expect(response).toStrictEqual(matchDescRsp(1));
+            });
+
+            it("matches any profile when the request carries the wildcard", () => {
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, 0xffff, [Ota], []),
+                    true,
+                );
+
+                expect(response).toStrictEqual(matchDescRsp(1));
+            });
+
+            it("matches output clusters against the endpoint's output clusters", () => {
+                // 0x0020 (poll control) is an output cluster of the endpoint
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, HaProfile, [], [0x0020]),
+                );
+
+                expect(response).toStrictEqual(matchDescRsp(1));
+            });
+
+            it("does not match an input cluster against the output clusters", () => {
+                // 0x0020 (poll control) is only an output cluster of the endpoint
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, HaProfile, [0x0020], []),
+                );
+
+                expect(response).toStrictEqual(matchDescRsp());
+            });
+
+            it("lists every matching endpoint once, in the order of the descriptors", () => {
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, 0xffff, [ZigbeeConsts.GP_CLUSTER_ID, Ota], [ZigbeeConsts.GP_CLUSTER_ID]),
+                    true,
+                );
+
+                expect(response).toStrictEqual(matchDescRsp(1, ZigbeeConsts.GP_ENDPOINT));
+            });
+
+            it("matches the green power endpoint on its own profile", () => {
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, GpProfile, [ZigbeeConsts.GP_CLUSTER_ID], []),
+                );
+
+                expect(response).toStrictEqual(matchDescRsp(ZigbeeConsts.GP_ENDPOINT));
+            });
+
+            it("sends nothing for a broadcast request that matches nothing", () => {
+                // wrong profile for the cluster, and a cluster no endpoint has
+                expect(
+                    apsHandler.getCoordinatorZDOResponse(
+                        ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                        matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, 0xc05e, [Ota], []),
+                        true,
+                    ),
+                ).toBeUndefined();
+                expect(
+                    apsHandler.getCoordinatorZDOResponse(
+                        ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                        matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, HaProfile, [0x1234], []),
+                        true,
+                    ),
+                ).toBeUndefined();
+            });
+
+            it("answers a request sent to the coordinator that matches nothing with an empty list", () => {
+                const response = apsHandler.getCoordinatorZDOResponse(
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, HaProfile, [0x1234], []),
+                );
+
+                expect(response).toStrictEqual(matchDescRsp());
+            });
+
+            it("does not answer for the address of another device", () => {
+                expect(
+                    apsHandler.getCoordinatorZDOResponse(ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, matchDescReq(0x1234, HaProfile, [Ota], [])),
+                ).toBeUndefined();
+            });
+
+            it("does not answer a request cut short", () => {
+                const request = matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, HaProfile, [Ota], [Ota]);
+
+                // fewer bytes than the fixed part, then than the input list, then than the output list
+                expect(apsHandler.getCoordinatorZDOResponse(ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, request.subarray(0, 6))).toBeUndefined();
+                expect(apsHandler.getCoordinatorZDOResponse(ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, request.subarray(0, 7))).toBeUndefined();
+                expect(
+                    apsHandler.getCoordinatorZDOResponse(ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, request.subarray(0, request.length - 1)),
+                ).toBeUndefined();
+                // the whole request is answered, so the cuts above are what made the difference
+                expect(apsHandler.getCoordinatorZDOResponse(ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, request)).toStrictEqual(matchDescRsp(1));
+            });
+
+            it("takes a broadcast request for the coordinator, and one for its address, and not one for another device", () => {
+                const forBroadcast = matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, HaProfile, [Ota], []);
+                const forCoordinator = matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, HaProfile, [Ota], []);
+                const forOther = matchDescReq(0x1234, HaProfile, [Ota], []);
+                const cluster = ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST;
+
+                expect(apsHandler.isZDORequestForCoordinator(cluster, ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, undefined, forBroadcast)).toStrictEqual(
+                    true,
+                );
+                expect(apsHandler.isZDORequestForCoordinator(cluster, ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, undefined, forCoordinator)).toStrictEqual(
+                    true,
+                );
+                expect(apsHandler.isZDORequestForCoordinator(cluster, ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, undefined, forOther)).toStrictEqual(false);
+                expect(
+                    apsHandler.isZDORequestForCoordinator(cluster, ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, undefined, Buffer.from([0x2a, 0x00])),
+                ).toStrictEqual(false);
+                // sent to the coordinator itself
+                expect(apsHandler.isZDORequestForCoordinator(cluster, ZigbeeConsts.COORDINATOR_ADDRESS, undefined, forCoordinator)).toStrictEqual(
+                    true,
+                );
+            });
+
+            it("sends the response to the requester, with its transaction sequence number", async () => {
+                const sendDataSpy = vi.spyOn(apsHandler, "sendData").mockResolvedValue(123);
+
+                await apsHandler.respondToCoordinatorZDORequest(
+                    matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, HaProfile, [Ota], [], 0x77),
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    0x1234,
+                    0x00124b0087654321n,
+                    true,
+                );
+
+                expect(sendDataSpy).toHaveBeenCalledTimes(1);
+                expect(sendDataSpy.mock.calls[0][0]).toStrictEqual(Buffer.from([0x77, 0x00, 0x00, 0x00, 0x01, 0x01]));
+                expect(sendDataSpy.mock.calls[0][2]).toStrictEqual(0x1234);
+                // the response cluster of Match_Desc_req (0x0006) is 0x8006
+                expect(sendDataSpy.mock.calls[0][5]).toStrictEqual(0x8006);
+
+                sendDataSpy.mockRestore();
+            });
+
+            it("sends nothing in answer to a broadcast request that matches nothing", async () => {
+                const sendDataSpy = vi.spyOn(apsHandler, "sendData").mockResolvedValue(123);
+
+                await apsHandler.respondToCoordinatorZDORequest(
+                    matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, HaProfile, [0x1234], []),
+                    ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    0x1234,
+                    0x00124b0087654321n,
+                    true,
+                );
+
+                expect(sendDataSpy).not.toHaveBeenCalled();
+
+                sendDataSpy.mockRestore();
+            });
+
+            it("tells the response that a request to a broadcast address was a broadcast", async () => {
+                const respondZDOSpy = vi.spyOn(apsHandler, "respondToCoordinatorZDORequest").mockResolvedValue(undefined);
+                const macHeader = { source16: 0x1234, source64: 0x00124b0087654321n } as MACHeader;
+                const apsHeader = {
+                    frameControl: {
+                        frameType: 0, // DATA
+                        deliveryMode: ZigbeeAPSDeliveryMode.UNICAST,
+                        ackFormat: false,
+                        security: false,
+                        ackRequest: false,
+                        extendedHeader: false,
+                    },
+                    destEndpoint: 0x00, // ZDO endpoint
+                    clusterId: ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST,
+                    profileId: 0x0000,
+                    sourceEndpoint: 0x00,
+                    counter: 11,
+                } as ZigbeeAPSHeader;
+                const broadcast = matchDescReq(ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE, HaProfile, [Ota], []);
+                const unicast = matchDescReq(ZigbeeConsts.COORDINATOR_ADDRESS, HaProfile, [Ota], []);
+
+                await apsHandler.processFrame(
+                    broadcast,
+                    macHeader,
+                    { source16: 0x1234, destination16: ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE } as ZigbeeNWKHeader,
+                    apsHeader,
+                    150,
+                );
+                await apsHandler.processFrame(
+                    unicast,
+                    macHeader,
+                    { source16: 0x1235, destination16: ZigbeeConsts.COORDINATOR_ADDRESS } as ZigbeeNWKHeader,
+                    { ...apsHeader, counter: 12 } as ZigbeeAPSHeader,
+                    150,
+                );
+
+                expect(respondZDOSpy).toHaveBeenCalledTimes(2);
+                // the NWK headers above carry no 64-bit source address
+                expect(respondZDOSpy.mock.calls[0]).toStrictEqual([broadcast, ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, 0x1234, undefined, true]);
+                expect(respondZDOSpy.mock.calls[1]).toStrictEqual([unicast, ZigbeeConsts.MATCH_DESCRIPTOR_REQUEST, 0x1235, undefined, false]);
+
+                respondZDOSpy.mockRestore();
+            });
+        });
+
         it("should respond to coordinator ZDO request", async () => {
             // Set up config attributes with sequence number at position 0
             const testNodeDesc = Buffer.from([0x42, 10, 11, 12, 13]);

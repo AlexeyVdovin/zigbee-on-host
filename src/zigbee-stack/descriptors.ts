@@ -68,6 +68,42 @@ const EP_GP_OUTPUT_CLUSTERS = [
 
 const ACTIVE_ENDPOINTS_RESPONSE = [0x00, 0x00, 0x00, 0x00, 2, EP_HA, EP_GP];
 
+const COORDINATOR_ENDPOINTS = [
+    { endpoint: EP_HA, profileId: EP_HA_PROFILE_ID, inputClusters: EP_HA_INPUT_CLUSTERS, outputClusters: EP_HA_OUTPUT_CLUSTERS },
+    { endpoint: EP_GP, profileId: EP_GP_PROFILE_ID, inputClusters: EP_GP_INPUT_CLUSTERS, outputClusters: EP_GP_OUTPUT_CLUSTERS },
+];
+
+/**
+ * 05-3474-23 #2.4.4.2.7.2 (Simple Descriptor Matching Rules)
+ *
+ * The coordinator's endpoints that match a Match_Desc_req criterion, in the order of the Simple Descriptors above,
+ * each once. An endpoint matches when its profile equals ProfileID (or ProfileID is the wildcard 0xffff) and one cluster
+ * of the request's input list is in the endpoint's input clusters, or one of the output list in its output clusters.
+ *
+ * @param profileId ProfileID of the request
+ * @param inputClusters InClusterList of the request
+ * @param outputClusters OutClusterList of the request
+ * @returns The matching endpoints
+ */
+export function matchCoordinatorEndpoints(profileId: number, inputClusters: number[], outputClusters: number[]): number[] {
+    const matched: number[] = [];
+
+    for (const ep of COORDINATOR_ENDPOINTS) {
+        if (ep.profileId !== profileId && profileId !== 0xffff) {
+            continue;
+        }
+
+        const inputMatch = inputClusters.some((cluster) => ep.inputClusters.includes(cluster));
+        const outputMatch = outputClusters.some((cluster) => ep.outputClusters.includes(cluster));
+
+        if (inputMatch || outputMatch) {
+            matched.push(ep.endpoint);
+        }
+    }
+
+    return matched;
+}
+
 export function encodeCoordinatorDescriptors(eui64: bigint): [address: Buffer, node: Buffer, power: Buffer, simple: Buffer, activeEndpoints: Buffer] {
     // works for both NETWORK & IEEE response
     const address = Buffer.alloc(12);
