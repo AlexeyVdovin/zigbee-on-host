@@ -740,6 +740,40 @@ describe("StackContext", () => {
             expect(context.getAppLinkKey(device64, context.netParams.eui64)).toStrictEqual(key);
         });
 
+        it("does not save a next hop entry, which would load back as a source route", async () => {
+            const device64 = 0x00124b0000abcdeen;
+            const address16 = 0x2346;
+
+            context.deviceTable.set(device64, {
+                address16,
+                capabilities: undefined,
+                authorized: true,
+                neighbor: false,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+            context.address16ToAddress64.set(address16, device64);
+            context.sourceRouteTable.set(address16, [
+                { relayAddresses: [0x4444], pathCost: 6, lastUpdated: Date.now(), failureCount: 0, lastUsed: undefined, nextHopOnly: true },
+                { relayAddresses: [0x5555, 0x4444], pathCost: 3, lastUpdated: Date.now(), failureCount: 0, lastUsed: undefined },
+            ]);
+
+            await context.saveState();
+
+            const reloaded = new StackContext(mockStackContextCallbacks, join(saveDir, "zoh.save"), createNetParams());
+
+            await reloaded.loadState();
+
+            const routes = reloaded.sourceRouteTable.get(address16);
+
+            expect(routes).toHaveLength(1);
+            expect(routes?.[0].relayAddresses).toStrictEqual([0x5555, 0x4444]);
+            expect(context.sourceRouteTable.get(address16)).toHaveLength(2);
+        });
+
         it("loads state with trailing padding after end marker", async () => {
             await context.saveState();
 

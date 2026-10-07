@@ -449,9 +449,10 @@ export class APSHandler {
         const macSeqNum = this.#macHandler.nextSeqNum();
         let relayIndex: number | undefined;
         let relayAddresses: number[] | undefined;
+        let nextHop16: number | undefined;
 
         try {
-            [relayIndex, relayAddresses] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
+            [relayIndex, relayAddresses, , nextHop16] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
         } catch (error) {
             logger.error(
                 `=x=> APS DATA[seqNum=(${apsCounter}/${nwkSeqNum}/${macSeqNum}) attempt=${attempt} nwkDst=${nwkDest16}:${nwkDest64}] ${(error as Error).message}`,
@@ -478,7 +479,7 @@ export class APSHandler {
         params.nwkDest16 = nwkDest16;
         params.nwkDest64 = nwkDest64;
 
-        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
+        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nextHop16 ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
 
         logger.debug(
             () =>
@@ -1002,9 +1003,10 @@ export class APSHandler {
         const nwkDest64 = nwkHeader.source64;
         let relayIndex: number | undefined;
         let relayAddresses: number[] | undefined;
+        let nextHop16: number | undefined;
 
         try {
-            [relayIndex, relayAddresses] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
+            [relayIndex, relayAddresses, , nextHop16] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
         } catch (error) {
             logger.debug(() => `=x=> APS ACK[dst16=${nwkDest16} seqNum=${nwkHeader.seqNum}] ${(error as Error).message}`, NS);
 
@@ -1025,7 +1027,7 @@ export class APSHandler {
             return;
         }
 
-        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
+        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nextHop16 ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
         // The ACK is a new frame from this device, so it takes this device's own NWK and MAC sequence numbers
         // (05-3474-23 #3.6.2.1, IEEE 802.15.4 macDSN). The acknowledged frame's numbers belong to its originator
         // and to its last hop: reusing them repeats a number this device may have just sent to the same next hop.
@@ -1326,9 +1328,10 @@ export class APSHandler {
         const macSeqNum = this.#macHandler.nextSeqNum();
         let relayIndex: number | undefined;
         let relayAddresses: number[] | undefined;
+        let nextHop16: number | undefined;
 
         try {
-            [relayIndex, relayAddresses] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
+            [relayIndex, relayAddresses, , nextHop16] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
         } catch (error) {
             logger.error(
                 `=x=> APS CMD[seqNum=(${apsCounter}/${nwkSeqNum}/${macSeqNum}) cmdId=${cmdId} nwkDst=${nwkDest16}:${nwkDest64}] ${(error as Error).message}`,
@@ -1351,7 +1354,7 @@ export class APSHandler {
             return false;
         }
 
-        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
+        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nextHop16 ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
 
         logger.debug(
             () =>
@@ -2810,9 +2813,11 @@ export class APSHandler {
         // XXX: this is not great...
         for (const [addr16] of this.#context.sourceRouteTable) {
             try {
-                const [relayLastIndex, relayAddresses] = this.#nwkHandler.findBestSourceRoute(addr16, undefined);
+                const [relayLastIndex, relayAddresses, , nextHop16] = this.#nwkHandler.findBestSourceRoute(addr16, undefined);
+                // last relay of a source route, or the next hop of a route learned from a route reply
+                const nextHopAddress = relayLastIndex !== undefined && relayAddresses !== undefined ? relayAddresses[relayLastIndex] : nextHop16;
 
-                if (relayLastIndex !== undefined && relayAddresses !== undefined) {
+                if (nextHopAddress !== undefined) {
                     if (sourceRouteTableIndex < startIndex) {
                         // if under `startIndex`, just count
                         sourceRouteTableIndex += 1;
@@ -2839,9 +2844,6 @@ export class APSHandler {
                         ((manyToOne << 4) & 0x10) |
                         ((routeRecordRequired << 5) & 0x20) |
                         ((0 /* reserved */ << 6) & 0xc0);
-                    // last entry is next hop
-                    const nextHopAddress = relayAddresses[relayLastIndex];
-
                     routingTableArr.push(addr16);
                     routingTableArr.push(statusByte);
                     routingTableArr.push(nextHopAddress);

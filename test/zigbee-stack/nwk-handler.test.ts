@@ -551,7 +551,7 @@ describe("NWK Handler", () => {
             expect(requestSpy).not.toHaveBeenCalled();
         });
 
-        it("stores a route reply sent on a child's behalf as a source route through its parent", () => {
+        it("stores a route reply sent on a child's behalf as the next hop through its parent", () => {
             addChild(false);
             const payload = Buffer.from([
                 ZigbeeNWKCommandId.ROUTE_REPLY,
@@ -577,11 +577,10 @@ describe("NWK Handler", () => {
                 } as ZigbeeNWKHeader,
             );
 
-            const [relayIndex, relays] = nwkHandler.findBestSourceRoute(child16, child64);
+            const route = nwkHandler.findBestSourceRoute(child16, child64);
             vi.runAllTimers();
 
-            expect(relayIndex).toStrictEqual(0);
-            expect(relays).toStrictEqual([parent16]);
+            expect(route).toStrictEqual([undefined, undefined, 2, parent16]);
             expect(requestSpy).not.toHaveBeenCalled();
         });
 
@@ -1428,10 +1427,11 @@ describe("NWK Handler", () => {
             expect(offset).toBeGreaterThan(0);
         });
 
-        it("refreshes existing source route entries when coordinator receives reply", () => {
+        it("refreshes an existing next hop entry when coordinator receives reply", () => {
             const responder16 = 0x2468;
             const nextHop = 0x3579;
             const existing = nwkHandler.createSourceRouteEntry([nextHop], 4);
+            existing.nextHopOnly = true;
             existing.failureCount = 3;
             mockContext.sourceRouteTable.set(responder16, [existing]);
             const markSuccessSpy = vi.spyOn(nwkHandler, "markRouteSuccess");
@@ -1477,6 +1477,113 @@ describe("NWK Handler", () => {
             expect(existing.failureCount).toStrictEqual(0);
             expect(updated?.pathCost).toStrictEqual(4);
             expect(updated?.relayAddresses).toEqual([nextHop]);
+        });
+
+        it("keeps a source route through the router a reply came from apart from the next hop it brings", () => {
+            const responder16 = 0x2468;
+            const responder64 = 0x00124b0000002468n;
+            const nextHop = 0x3579;
+            mockContext.address16ToAddress64.set(responder16, responder64);
+            const sourceRoute = nwkHandler.createSourceRouteEntry([nextHop], 2);
+            mockContext.sourceRouteTable.set(responder16, [sourceRoute]);
+
+            const payload = Buffer.from([
+                ZigbeeNWKCommandId.ROUTE_REPLY,
+                0x00,
+                0xab,
+                ZigbeeConsts.COORDINATOR_ADDRESS & 0xff,
+                (ZigbeeConsts.COORDINATOR_ADDRESS >> 8) & 0xff,
+                responder16 & 0xff,
+                (responder16 >> 8) & 0xff,
+                0x06,
+            ]);
+
+            nwkHandler.processRouteReply(
+                payload,
+                1,
+                { frameControl: {}, source16: nextHop, sequenceNumber: 13 } as MACHeader,
+                {
+                    frameControl: {},
+                    source16: nextHop,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    relayAddresses: undefined,
+                    seqNum: 14,
+                } as ZigbeeNWKHeader,
+            );
+
+            const entries = mockContext.sourceRouteTable.get(responder16);
+
+            expect(entries).toHaveLength(2);
+            expect(entries?.[0]).toBe(sourceRoute);
+            expect(sourceRoute.nextHopOnly).toBeUndefined();
+            expect(entries?.[1].relayAddresses).toStrictEqual([nextHop]);
+            expect(entries?.[1].nextHopOnly).toStrictEqual(true);
+            // the source route is cheaper and wins
+            expect(nwkHandler.findBestSourceRoute(responder16, responder64)).toStrictEqual([0, [nextHop], 2]);
+        });
+
+        it("stores a route reply from the responder itself as a direct route", () => {
+            const responder16 = 0x2469;
+            const responder64 = 0x00124b0000002469n;
+            mockContext.address16ToAddress64.set(responder16, responder64);
+
+            const payload = Buffer.from([
+                ZigbeeNWKCommandId.ROUTE_REPLY,
+                0x00,
+                0xac,
+                ZigbeeConsts.COORDINATOR_ADDRESS & 0xff,
+                (ZigbeeConsts.COORDINATOR_ADDRESS >> 8) & 0xff,
+                responder16 & 0xff,
+                (responder16 >> 8) & 0xff,
+                0x01,
+            ]);
+
+            nwkHandler.processRouteReply(
+                payload,
+                1,
+                { frameControl: {}, source16: responder16, sequenceNumber: 15 } as MACHeader,
+                {
+                    frameControl: {},
+                    source16: responder16,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    relayAddresses: undefined,
+                    seqNum: 16,
+                } as ZigbeeNWKHeader,
+            );
+
+            const entries = mockContext.sourceRouteTable.get(responder16);
+
+            expect(entries).toHaveLength(1);
+            expect(entries?.[0].relayAddresses).toStrictEqual([]);
+            expect(entries?.[0].nextHopOnly).toBeUndefined();
+            expect(nwkHandler.findBestSourceRoute(responder16, responder64)).toStrictEqual([undefined, undefined, 1]);
+        });
+
+        it("stores a route record beside a next hop entry with the same relay and cost", async () => {
+            const source16 = 0x246a;
+            const source64 = 0x00124b000000246an;
+            const nextHop = 0x3579;
+            mockContext.address16ToAddress64.set(source16, source64);
+            const nextHopEntry = nwkHandler.createSourceRouteEntry([nextHop], 2);
+            nextHopEntry.nextHopOnly = true;
+            mockContext.sourceRouteTable.set(source16, [nextHopEntry]);
+
+            await nwkHandler.processCommand(
+                Buffer.from([ZigbeeNWKCommandId.ROUTE_RECORD, 1, nextHop & 0xff, (nextHop >> 8) & 0xff]),
+                { frameControl: {}, source16: nextHop, sequenceNumber: 17 } as MACHeader,
+                {
+                    frameControl: {},
+                    source16,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    seqNum: 18,
+                } as ZigbeeNWKHeader,
+            );
+
+            const entries = mockContext.sourceRouteTable.get(source16);
+
+            expect(entries).toHaveLength(2);
+            expect(entries?.[1].relayAddresses).toStrictEqual([nextHop]);
+            expect(entries?.[1].nextHopOnly).toBeUndefined();
         });
 
         it("should process network status", async () => {
@@ -2562,7 +2669,7 @@ describe("NWK Handler", () => {
         expect(routes?.[0].failureCount).toStrictEqual(0);
     });
 
-    it("updates source route entries when route reply introduces new path", () => {
+    it("adds a next hop entry when a route reply comes through a new router", () => {
         const responder16 = 0x6677;
         const responder64 = 0x00124b0010102020n;
 
@@ -2612,7 +2719,9 @@ describe("NWK Handler", () => {
         const routes = mockContext.sourceRouteTable.get(responder16);
         expect(routes).toBeDefined();
         expect(routes).toHaveLength(2);
-        expect(routes?.[1].relayAddresses).toEqual([0x9999, 0x2222]);
+        // only the next hop: the reply carries no path to the responder
+        expect(routes?.[1].relayAddresses).toEqual([0x2222]);
+        expect(routes?.[1].nextHopOnly).toStrictEqual(true);
     });
 
     it("skips neighbors without short address mapping in periodic link status", async () => {

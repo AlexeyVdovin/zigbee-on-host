@@ -190,6 +190,11 @@ export type SourceRouteTableEntry = {
     failureCount: number;
     /** Timestamp when this route was last used successfully (undefined if never used) */
     lastUsed?: number;
+    /**
+     * Learned from a route reply: `relayAddresses` holds only the next hop, which routes the frame on by its own table.
+     * Sent without a source route subframe. Runtime-only: the save format has no field for it.
+     */
+    nextHopOnly?: boolean;
 };
 
 export type AppLinkKeyStoreEntry = {
@@ -1176,7 +1181,8 @@ export class StackContext {
 
         // device table (count is implicit in number of DEVICE_ENTRY tags)
         for (const [device64, device] of this.deviceTable) {
-            const sourceRouteEntries = this.sourceRouteTable.get(device.address16);
+            // a next hop entry would load back as a source route that names only the next hop
+            const sourceRouteEntries = this.sourceRouteTable.get(device.address16)?.filter((entry) => !entry.nextHopOnly);
             const deviceEntry = serializeDeviceEntry(
                 device64,
                 device.address16,

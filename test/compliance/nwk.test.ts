@@ -1022,6 +1022,48 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
             expect(macFrame.header.destination16).toStrictEqual(relays[relays.length - 1]);
         });
 
+        it("sends through the next hop a route reply came from, without a source route", async () => {
+            // the responder is two hops out: a router answered for it, and the reply came back through another
+            registerRouter(false);
+            const nextHop16 = 0x4444;
+            registerNeighborDevice(context, nextHop16, 0x00124b0000004444n);
+            const reply = Buffer.alloc(8);
+            let offset = reply.writeUInt8(ZigbeeNWKCommandId.ROUTE_REPLY, 0);
+            offset = reply.writeUInt8(0x00, offset); // options
+            offset = reply.writeUInt8(0x21, offset); // route request id
+            offset = reply.writeUInt16LE(ZigbeeConsts.COORDINATOR_ADDRESS, offset);
+            offset = reply.writeUInt16LE(routerShortAddress, offset); // responder
+            reply.writeUInt8(6, offset); // path cost
+            const { macHeader, nwkHeader } = makeRouteRecordHeaders();
+            macHeader.source16 = nextHop16;
+            nwkHeader.source16 = nextHop16;
+
+            await nwkHandler.processCommand(reply, macHeader, nwkHeader);
+
+            const macFrame = await captureMacFrame(
+                () =>
+                    apsHandler.sendData(
+                        Buffer.from([0xab]),
+                        ZigbeeNWKRouteDiscovery.SUPPRESS,
+                        routerShortAddress,
+                        routerIeeeAddress,
+                        ZigbeeAPSDeliveryMode.UNICAST,
+                        0x0104,
+                        0x0104,
+                        1,
+                        1,
+                        undefined,
+                    ),
+                mockMACHandlerCallbacks,
+            );
+            const { nwkFrameControl, nwkHeader: outboundNWK } = decodeNWKFromMacFrame(macFrame, true);
+
+            expect(macFrame.header.destination16).toStrictEqual(nextHop16);
+            expect(outboundNWK.destination16).toStrictEqual(routerShortAddress);
+            expect(nwkFrameControl.sourceRoute).toStrictEqual(false);
+            expect(outboundNWK.relayAddresses).toBeUndefined();
+        });
+
         it("requests route repair when data is sent without a prior route record", async () => {
             vi.useFakeTimers();
             registerRouter(false);

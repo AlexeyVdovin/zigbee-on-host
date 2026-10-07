@@ -1193,6 +1193,27 @@ describe("APS Handler", () => {
             expect(routingTable.readUInt16LE(13)).toStrictEqual(0x0003); // next hop
         });
 
+        it("lists the next hop of a route learned from a route reply", () => {
+            mockContext.sourceRouteTable.set(0x1234, [
+                {
+                    relayAddresses: [0x0004],
+                    pathCost: 6,
+                    lastUpdated: Date.now(),
+                    failureCount: 0,
+                    lastUsed: undefined,
+                    nextHopOnly: true,
+                },
+            ]);
+            mockContext.address16ToAddress64.set(0x1234, 0x00124b0000001234n);
+
+            const routingTable = apsHandler.getRoutingTableResponse(0);
+
+            expect(routingTable.readUInt8(2)).toStrictEqual(1); // total entries
+            expect(routingTable.readUInt8(4)).toStrictEqual(1); // entries following
+            expect(routingTable.readUInt16LE(5)).toStrictEqual(0x1234);
+            expect(routingTable.readUInt16LE(8)).toStrictEqual(0x0004); // next hop
+        });
+
         it("should handle routing table with start index and clipping", () => {
             // Add many source routes
             for (let i = 0; i < 300; i++) {

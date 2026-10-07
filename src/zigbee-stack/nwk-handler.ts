@@ -131,7 +131,8 @@ export class NWKHandler {
      * Without a route the spec has the originator "initiate route discovery" for the destination (#3.6.4.3). It has
      * no frame sent to the destination's own address, which only a neighbour can hear. A router answers a route
      * request for one of its end device children on the child's behalf (#3.6.4.5.1.2), so a sleeping child need not
-     * be awake to be found, and `processRouteReply` stores the answer as a source route through that router.
+     * be awake to be found, and `processRouteReply` stores the answer as a next hop: the router the reply came from,
+     * which forwards the frame by the routing table entry the discovery left it.
      *
      * The many-to-one request sent beside this one names no destination: a parent answers it with route records
      * only for the children that transmit by themselves, and a sleeping child may not for hours.
@@ -402,6 +403,7 @@ export class NWKHandler {
      * - request valid and source route unavailable (unknown device or neighbor): [undefined, undefined, undefined]
      * - request valid and source route available and >=1 relay: [last index in relayAddresses, list of relay addresses, cost of the path]
      * - request valid and source route available and 0 relay: [undefined, undefined, cost of the path]
+     * - request valid and only a next hop known (from a route reply): [undefined, undefined, cost of the path, next hop]
      */
     /**
      * 05-3474-23 #3.6.3.3 (Source routing tables)
@@ -540,7 +542,7 @@ export class NWKHandler {
         destination16: number | undefined,
         destination64: bigint | undefined,
         ignoreStale = false,
-    ): [relayIndex: number | undefined, relayAddresses: number[] | undefined, pathCost: number | undefined] {
+    ): [relayIndex: number | undefined, relayAddresses: number[] | undefined, pathCost: number | undefined, nextHop16?: number] {
         if (destination16 !== undefined && destination16 >= ZigbeeConsts.BCAST_MIN) {
             return [undefined, undefined, undefined];
         }
@@ -620,6 +622,11 @@ export class NWKHandler {
         // `validEntries` IS the array just stored in the table, and an in-place sort would
         // reorder persistent state as a side effect of a read. See `#lowestScoringEntry`.
         const bestEntry = this.#lowestScoringEntry(validEntries, now)!;
+
+        if (bestEntry.nextHopOnly) {
+            // no source route: the next hop routes the frame on by its own table
+            return [undefined, undefined, bestEntry.pathCost, bestEntry.relayAddresses[0]];
+        }
 
         if (bestEntry.relayAddresses.length === 0) {
             // direct route (cost only, no relays)
@@ -844,7 +851,11 @@ export class NWKHandler {
         }
 
         for (const existingEntry of existingEntries) {
-            if (newEntry.pathCost === existingEntry.pathCost && newEntry.relayAddresses.length === existingEntry.relayAddresses.length) {
+            if (
+                newEntry.pathCost === existingEntry.pathCost &&
+                newEntry.relayAddresses.length === existingEntry.relayAddresses.length &&
+                !newEntry.nextHopOnly === !existingEntry.nextHopOnly
+            ) {
                 let matching = true;
 
                 for (let i = 0; i < newEntry.relayAddresses.length; i++) {
@@ -874,6 +885,7 @@ export class NWKHandler {
      *
      * SPEC COMPLIANCE NOTES:
      * - ✅ Matches on the relay hop list, which is the identity of a path; refreshes cost, age and failure count on a match
+     * - ✅ A next hop entry (from a route reply) and a source route through the same relay are different paths
      * - ✅ Accepts optional pre-fetched entry array to avoid redundant map lookups
      * - ⚠️  Formally spec route table holds single entry per destination; this helper assumes multi-entry model
      * DEVICE SCOPE: Coordinator, routers (N/A)
@@ -888,7 +900,7 @@ export class NWKHandler {
         }
 
         for (const existingEntry of entries) {
-            if (newEntry.relayAddresses.length === existingEntry.relayAddresses.length) {
+            if (newEntry.relayAddresses.length === existingEntry.relayAddresses.length && !newEntry.nextHopOnly === !existingEntry.nextHopOnly) {
                 let matching = true;
 
                 for (let i = 0; i < newEntry.relayAddresses.length; i++) {
@@ -966,9 +978,10 @@ export class NWKHandler {
         const macSeqNum = this.#macHandler.nextSeqNum();
         let relayIndex: number | undefined;
         let relayAddresses: number[] | undefined;
+        let nextHop16: number | undefined;
 
         try {
-            [relayIndex, relayAddresses] = this.findBestSourceRoute(nwkDest16, nwkDest64);
+            [relayIndex, relayAddresses, , nextHop16] = this.findBestSourceRoute(nwkDest16, nwkDest64);
         } catch (error) {
             logger.error(
                 `=x=> NWK CMD[seqNum=(${nwkSeqNum}/${macSeqNum}) cmdId=${cmdId} nwkDst=${nwkDest16}:${nwkDest64}] ${(error as Error).message}`,
@@ -978,7 +991,7 @@ export class NWKHandler {
             return false;
         }
 
-        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
+        const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nextHop16 ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
 
         logger.debug(
             () =>
@@ -1283,19 +1296,25 @@ export class NWKHandler {
             NS,
         );
 
-        // Cache source route to responder when coordinator initiated discovery
+        // Cache the route to the responder when the coordinator initiated discovery.
+        // A route reply is relayed hop by hop and carries no path (#3.4.2), so it gives the next hop and nothing
+        // further. The originator's routing table entry gets that next hop (#3.6.4.5.2), and every router on the
+        // way set its own entry while relaying the reply. Stored as a source route, the next hop would be told to
+        // deliver straight to the responder, which it reaches only when it is the responder's parent.
         if (originator16 === ZigbeeConsts.COORDINATOR_ADDRESS) {
-            const nextHopCandidates: number[] = nwkHeader.relayAddresses !== undefined ? [...nwkHeader.relayAddresses] : [];
             const macNextHop =
                 macHeader.source16 ?? (macHeader.source64 !== undefined ? this.#context.deviceTable.get(macHeader.source64)?.address16 : undefined);
 
-            if (macNextHop !== undefined && macNextHop !== responder16) {
-                if (nextHopCandidates.length === 0 || nextHopCandidates[nextHopCandidates.length - 1] !== macNextHop) {
-                    nextHopCandidates.push(macNextHop);
-                }
+            if (macNextHop === undefined) {
+                return offset;
             }
 
-            const routeEntry = this.createSourceRouteEntry(nextHopCandidates, pathCost === 0 ? nextHopCandidates.length + 1 : pathCost);
+            const viaRouter = macNextHop !== responder16;
+            const routeEntry = this.createSourceRouteEntry(viaRouter ? [macNextHop] : [], pathCost === 0 ? (viaRouter ? 2 : 1) : pathCost);
+
+            if (viaRouter) {
+                routeEntry.nextHopOnly = true;
+            }
 
             // TODO: do we want this here?
             this.upsertSourceRoute(responder16, routeEntry);
