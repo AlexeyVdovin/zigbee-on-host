@@ -1241,6 +1241,12 @@ describe("Integration and End-to-End Compliance", () => {
 
             await nwkHandler.processCommand(payload, macHeader, nwkHeader);
 
+            // #3.4.7.1: the request says RxOnWhenIdle = 0, so the response waits for the device's next poll
+            expect(frames).toHaveLength(0);
+            expect(context.indirectTransmissions.get(device64)).toHaveLength(1);
+
+            await context.indirectTransmissions.get(device64)!.shift()!.sendFrame();
+
             expect(frames).toHaveLength(1);
             const decoded = decodeNwkCommandFromMac(frames[0]!, context.netParams.eui64);
             const { nwkPayload } = decoded;
@@ -1307,6 +1313,8 @@ describe("Integration and End-to-End Compliance", () => {
             const payload = Buffer.from([ZigbeeNWKCommandId.REJOIN_REQ, encodeMACCapabilities(context.deviceTable.get(device64)!.capabilities!)]);
 
             await nwkHandler.processCommand(payload, macHeader, nwkHeader);
+            // #3.4.7.1: the request says RxOnWhenIdle = 0, so the response waits for the device's next poll
+            await context.indirectTransmissions.get(device64)!.shift()!.sendFrame();
 
             expect(frames).toHaveLength(1);
             const decoded = decodeNwkCommandFromMac(frames[0]!, context.netParams.eui64);

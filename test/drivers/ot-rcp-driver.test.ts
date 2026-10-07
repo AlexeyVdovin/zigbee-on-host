@@ -678,8 +678,8 @@ describe("OT RCP Driver", () => {
             expect(driver.context.address16ToAddress64.get(3457)).toStrictEqual(12656887476334n);
             expect(driver.context.address16ToAddress64.get(9674)).toStrictEqual(12328965645634n);
             expect(driver.context.address16ToAddress64.get(54748)).toStrictEqual(234367481234n);
-            expect(driver.context.indirectTransmissions.size).toStrictEqual(1);
-            expect(driver.context.indirectTransmissions.get(12328965645634n)).toStrictEqual([]);
+            // the only RFD is not a neighbor: its parent is a router, which it polls instead of the coordinator
+            expect(driver.context.indirectTransmissions.size).toStrictEqual(0);
             expect(driver.context.sourceRouteTable.size).toStrictEqual(2);
             const route1 = driver.context.sourceRouteTable.get(1)!;
             expect(route1).toHaveLength(2);
@@ -924,7 +924,8 @@ describe("OT RCP Driver", () => {
             expect(newAddr16).toStrictEqual(network16);
             expect(driver.context.deviceTable.get(network64)).toBeDefined();
             expect(driver.context.address16ToAddress64.get(network16)).toBeDefined();
-            expect(driver.context.indirectTransmissions.get(network64)).toBeDefined();
+            // not a neighbor: it polls its parent, not the coordinator
+            expect(driver.context.indirectTransmissions.get(network64)).toBeUndefined();
             expect(driver.context.sourceRouteTable.get(network16)).toBeUndefined();
             expect(driver.context.pendingAssociations.get(network64)).toBeUndefined();
 
@@ -1242,7 +1243,8 @@ describe("OT RCP Driver", () => {
             expect(newAddr16).toStrictEqual(network16);
             expect(driver.context.deviceTable.get(network64)).toBeDefined();
             expect(driver.context.address16ToAddress64.get(network16)).toBeDefined();
-            expect(driver.context.indirectTransmissions.get(network64)).toBeDefined();
+            // not a neighbor: it polls its parent, not the coordinator
+            expect(driver.context.indirectTransmissions.get(network64)).toBeUndefined();
             expect(driver.context.sourceRouteTable.get(network16)).toBeUndefined();
             expect(driver.context.pendingAssociations.get(network64)).toBeUndefined();
 

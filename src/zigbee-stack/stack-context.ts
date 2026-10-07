@@ -1294,10 +1294,7 @@ export class StackContext {
                     linkStatusMisses: 0, // will stay zero for RFDs
                 });
                 this.address16ToAddress64.set(address16, address64);
-
-                if (decodedCap && !decodedCap.rxOnWhenIdle) {
-                    this.indirectTransmissions.set(address64, []);
-                }
+                this.#updateIndirectQueue(address64, decodedCap, neighbor);
 
                 if (sourceRouteEntries.length > 0) {
                     const routes = sourceRouteEntries.map((entry) => ({
@@ -1420,6 +1417,36 @@ export class StackContext {
     }
 
     /**
+     * 05-3474-23 #2.5.4.5.5.2 (Normal Operating State), IEEE 802.15.4-2015 #6.7.3
+     *
+     * Keep an indirect transmission queue for a device exactly while it is an rx-off-when-idle child of the coordinator.
+     * Such a device polls its parent for indirect transmissions, and only its parent: a queue at the coordinator for a device
+     * whose parent is a router never sees a Data Request, so every frame put in it is held and never sent, and never pruned.
+     *
+     * For an end device, `neighbor` says the coordinator is its parent: it is set from the device's own association or rejoin
+     * to the coordinator, and cleared when a router reports the device as joined or rejoined through it.
+     *
+     * SPEC COMPLIANCE NOTES:
+     * - ✅ Queues only for the coordinator's own rx-off-when-idle children
+     * - ✅ Keeps the frames already queued for a child that rejoins the coordinator
+     * - ✅ Drops the queue of a device that moved to another parent: it can no longer poll for those frames here
+     * DEVICE SCOPE: Coordinator, routers (N/A)
+     *
+     * @param address64 The device
+     * @param capabilities Its MAC capabilities, if known
+     * @param neighbor True if the coordinator is its parent
+     */
+    #updateIndirectQueue(address64: bigint, capabilities: MACCapabilities | undefined, neighbor: boolean): void {
+        if (neighbor && capabilities !== undefined && !capabilities.rxOnWhenIdle) {
+            if (!this.indirectTransmissions.has(address64)) {
+                this.indirectTransmissions.set(address64, []);
+            }
+        } else {
+            this.indirectTransmissions.delete(address64);
+        }
+    }
+
+    /**
      * Handle device association (initial join or rejoin)
      *
      * SPEC COMPLIANCE:
@@ -1427,7 +1454,7 @@ export class StackContext {
      * - ✅ Assigns network addresses correctly
      * - ✅ Detects and handles address conflicts
      * - ✅ Creates device table entries with capabilities
-     * - ✅ Sets up indirect transmission for rxOnWhenIdle=false
+     * - ✅ Sets up indirect transmission for rxOnWhenIdle=false children, on join and on rejoin
      * - ✅ Returns appropriate status codes per IEEE 802.15.4
      * - ✅ Triggers state save after association
      * - ⚠️ Unknown rejoins succeed if allowOverride=true (potential security risk)
@@ -1622,11 +1649,8 @@ export class StackContext {
                     linkStatusMisses: 0, // will stay zero for RFDs
                 });
                 this.address16ToAddress64.set(newAddress16, source64!);
-
                 // `processUpdateDevice` has no `capabilities` info, device is joined through router, so, no indirect tx for coordinator
-                if (capabilities && !capabilities.rxOnWhenIdle) {
-                    this.indirectTransmissions.set(source64!, []);
-                }
+                this.#updateIndirectQueue(source64!, capabilities, neighbor);
 
                 requiresTransportKey = true;
             } else {
@@ -1636,6 +1660,7 @@ export class StackContext {
                 device.address16 = newAddress16;
                 device.capabilities = capabilities;
                 device.neighbor = neighbor;
+                this.#updateIndirectQueue(source64!, capabilities, neighbor);
 
                 if (device.lastTransportedNetworkKeySeq !== this.netParams.networkKeySequenceNumber) {
                     requiresTransportKey = true;

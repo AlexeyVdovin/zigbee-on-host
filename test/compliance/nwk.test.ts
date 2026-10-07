@@ -2115,6 +2115,13 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
 
             await nwkHandler.processCommand(payload, macHeader, nwkHeader);
 
+            if (frames.length === 0) {
+                // #3.4.7.1: a response to a sleepy child of the coordinator waits for its next poll
+                const queued = context.indirectTransmissions.get(options?.source64 ?? rejoiner64)?.shift();
+
+                await queued?.sendFrame();
+            }
+
             expect(frames).toHaveLength(1);
             const macFrame = decodeMACFramePayload(frames[0]!);
             const { nwkFrameControl, nwkHeader: responseHeader, nwkPayload } = decodeNWKFromMacFrame(macFrame, true);

@@ -1006,6 +1006,94 @@ describe("StackContext", () => {
         });
     });
 
+    describe("indirect transmission queue", () => {
+        const sleepyCapabilities: MACCapabilities = {
+            alternatePANCoordinator: false,
+            deviceType: 0,
+            powerSource: 0,
+            rxOnWhenIdle: false,
+            securityCapability: false,
+            allocateAddress: true,
+        };
+        const sendDirect = async () => await Promise.resolve(true);
+
+        const addDevice = (target: StackContext, address64: bigint, address16: number, neighbor: boolean) => {
+            target.deviceTable.set(address64, {
+                address16,
+                capabilities: sleepyCapabilities,
+                authorized: true,
+                neighbor,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+            target.address16ToAddress64.set(address16, address64);
+        };
+
+        it("is restored on load only for a sleepy child of the coordinator", async () => {
+            const child64 = 0x00124b0000aaaa01n;
+            const routerChild64 = 0x00124b0000aaaa02n;
+
+            addDevice(context, child64, 0x1001, true);
+            addDevice(context, routerChild64, 0x1002, false);
+
+            await context.saveState();
+
+            const reloaded = new StackContext(mockStackContextCallbacks, join(saveDir, "zoh.save"), createNetParams());
+
+            await reloaded.loadState();
+
+            expect(reloaded.deviceTable.get(routerChild64)?.capabilities?.rxOnWhenIdle).toStrictEqual(false);
+            expect(reloaded.indirectTransmissions.has(child64)).toStrictEqual(true);
+            expect(reloaded.indirectTransmissions.has(routerChild64)).toStrictEqual(false);
+        });
+
+        it("is not created for a sleepy device joining through a router", async () => {
+            const device64 = 0x00124b0000aaaa03n;
+
+            await context.associate(0x1003, device64, true, sleepyCapabilities, false, false, true);
+
+            expect(context.indirectTransmissions.has(device64)).toStrictEqual(false);
+        });
+
+        it("is created when a sleepy device rejoins with the coordinator as its parent", async () => {
+            const device64 = 0x00124b0000aaaa04n;
+
+            addDevice(context, device64, 0x1004, false);
+
+            const [status] = await context.associate(0x1004, device64, false, sleepyCapabilities, true);
+
+            expect(status).toStrictEqual(MACAssociationStatus.SUCCESS);
+            expect(context.indirectTransmissions.get(device64)).toStrictEqual([]);
+        });
+
+        it("keeps the frames already queued for a child that rejoins the coordinator", async () => {
+            const device64 = 0x00124b0000aaaa05n;
+            const queued = { sendFrame: sendDirect, timestamp: Date.now() };
+
+            addDevice(context, device64, 0x1005, true);
+            context.indirectTransmissions.set(device64, [queued]);
+
+            await context.associate(0x1005, device64, false, sleepyCapabilities, true);
+
+            expect(context.indirectTransmissions.get(device64)).toStrictEqual([queued]);
+        });
+
+        it("is dropped when a child rejoins through a router", async () => {
+            const device64 = 0x00124b0000aaaa06n;
+
+            addDevice(context, device64, 0x1006, true);
+            context.indirectTransmissions.set(device64, [{ sendFrame: sendDirect, timestamp: Date.now() }]);
+
+            // as from APS UPDATE_DEVICE: no MAC capabilities, not a neighbor
+            await context.associate(0x1006, device64, false, undefined, false, false, true);
+
+            expect(context.indirectTransmissions.has(device64)).toStrictEqual(false);
+        });
+    });
+
     describe("save-serializer defensive parsing", () => {
         it("throws when device entry header is truncated", () => {
             const truncated = Buffer.from([DeviceTLVTag.DEVICE_ADDRESS64]);
