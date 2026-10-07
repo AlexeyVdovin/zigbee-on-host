@@ -3356,10 +3356,12 @@ describe("OT RCP Driver", () => {
                 createTestSourceRouteEntry([0x4, 0x5], 3),
                 createTestSourceRouteEntry([0x6, 0x7, 0x8], 4),
             ]);
-            driver.context.macNoACKs.set(0x4, 3);
-            driver.context.macNoACKs.set(0x2, 5);
+            // the first hop is the last relay; NO_ACKs further out do not filter a route
+            driver.context.macNoACKs.set(0x5, 3);
+            driver.context.macNoACKs.set(0x3, 5);
+            driver.context.macNoACKs.set(0x7, 2);
             await vi.advanceTimersByTimeAsync(5000); // not past concentrator min time
-            // Routes with bad relays are filtered, best remaining route is returned
+            // Routes with bad first hops are filtered, best remaining route is returned
             expect(driver.nwkHandler.findBestSourceRoute(0x6887, undefined)).toStrictEqual([2, [0x6, 0x7, 0x8], 4]);
             await vi.advanceTimersByTimeAsync(10); // flush
             expect(sendPeriodicManyToOneRouteRequestSpy).toHaveBeenCalledTimes(1);
@@ -4042,8 +4044,8 @@ describe("OT RCP Driver", () => {
                 createTestSourceRouteEntry([0x0003], 2), // good route
             ]);
 
-            // mark relay 0x0001 as having too many NO_ACKs
-            driver.context.macNoACKs.set(0x0001, 3); // threshold
+            // mark relay 0x0002, the first hop of [0x0001, 0x0002], as having too many NO_ACKs
+            driver.context.macNoACKs.set(0x0002, 3); // threshold
 
             const sendPeriodicManyToOneRouteRequestSpy = vi.spyOn(driver.nwkHandler, "sendPeriodicManyToOneRouteRequest");
 

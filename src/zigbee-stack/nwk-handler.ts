@@ -381,7 +381,9 @@ export class NWKHandler {
      *       - Recency bonus (recently used routes) ✅
      *       - This is more sophisticated than spec requires
      * - ✅ Checks MAC NO_ACK tracking for relay validation
-     *       - Filters out routes with unreliable relays ✅
+     *       - Filters out routes whose first hop (the relay we transmit to) is not acknowledging ✅
+     *       - Relays further out are not judged by it: a NO_ACK from sending to one directly only says it is not our
+     *         neighbor, and a relay that fails to forward is reported by the relay before it (source route failure)
      * - ✅ Triggers many-to-one route request when no valid routes
      *       - Uses setImmediate for non-blocking trigger ✅
      * - ⚠️  SPEC DEVIATION: Route table per spec should be:
@@ -418,7 +420,7 @@ export class NWKHandler {
      *
      * SPEC COMPLIANCE NOTES:
      * - ✅ Applies route expiry, consecutive-failure blacklisting and hop count limits
-     * - ✅ Rejects a path whose relay is not acknowledging at the MAC layer (spec #3.6.3.5)
+     * - ✅ Rejects a path whose first hop is not acknowledging at the MAC layer (spec #3.6.3.5)
      * DEVICE SCOPE: Coordinator, routers (N/A)
      *
      * @param entry Entry to judge
@@ -447,12 +449,14 @@ export class NWKHandler {
             return `has too many hops (${entry.relayAddresses.length})`;
         }
 
-        // check if any relay has too many NO_ACK
-        for (const relay of entry.relayAddresses) {
-            const macNoACKs = this.#context.macNoACKs.get(relay);
+        // check if the first hop has too many NO_ACK: it is the only relay the MAC transmits to (the last one)
+        const firstHop = entry.relayAddresses[entry.relayAddresses.length - 1];
+
+        if (firstHop !== undefined) {
+            const macNoACKs = this.#context.macNoACKs.get(firstHop);
 
             if (macNoACKs !== undefined && macNoACKs >= CONFIG_NWK_CONCENTRATOR_DELIVERY_FAILURE_THRESHOLD) {
-                return `via relay ${relay} has too many NO_ACKs (${macNoACKs})`;
+                return `via relay ${firstHop} has too many NO_ACKs (${macNoACKs})`;
             }
         }
 

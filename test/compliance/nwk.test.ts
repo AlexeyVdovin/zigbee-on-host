@@ -941,6 +941,60 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
                 expect(context.sourceRouteTable.get(routerShortAddress)).toHaveLength(2);
             });
         });
+
+        describe("MAC NO_ACKs on a route's relays", () => {
+            const distant16 = 0x99ac;
+            const distant64 = 0x00124b00aabbcce0n;
+
+            beforeEach(() => {
+                context.deviceTable.set(distant64, {
+                    address16: distant16,
+                    capabilities: {
+                        alternatePANCoordinator: false,
+                        deviceType: 1,
+                        powerSource: 1,
+                        rxOnWhenIdle: true,
+                        securityCapability: true,
+                        allocateAddress: true,
+                    },
+                    authorized: true,
+                    neighbor: false,
+                    lastTransportedNetworkKeySeq: undefined,
+                    recentLQAs: [],
+                    incomingNWKFrameCounter: undefined,
+                    endDeviceTimeout: undefined,
+                    linkStatusMisses: 0,
+                });
+                context.address16ToAddress64.set(distant16, distant64);
+                context.sourceRouteTable.set(distant16, [nwkHandler.createSourceRouteEntry([0x2222, 0x3333], 3)]);
+            });
+
+            it("keeps a route whose relay further out once failed a direct send", () => {
+                vi.useFakeTimers();
+                const sendMTORR = vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                // a direct attempt to 0x2222 got no ACK: it is not our neighbor, which says nothing about it as a relay
+                context.macNoACKs.set(0x2222, 1);
+
+                const [relayIndex, relays] = nwkHandler.findBestSourceRoute(distant16, distant64);
+                vi.runAllTimers();
+
+                expect(relayIndex).toStrictEqual(1);
+                expect(relays).toStrictEqual([0x2222, 0x3333]);
+                expect(sendMTORR).not.toHaveBeenCalled();
+            });
+
+            it("drops a route whose first hop is not acknowledging", () => {
+                vi.useFakeTimers();
+                const sendMTORR = vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                context.macNoACKs.set(0x3333, 1);
+
+                expect(nwkHandler.findBestSourceRoute(distant16, distant64)).toStrictEqual([undefined, undefined, undefined]);
+                vi.runAllTimers();
+
+                expect(context.sourceRouteTable.has(distant16)).toStrictEqual(false);
+                expect(sendMTORR).toHaveBeenCalled();
+            });
+        });
     });
 
     /**
