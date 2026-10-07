@@ -366,6 +366,9 @@ export class NWKHandler {
      * - ✅ Returns undefined arrays for direct communication (neighbor devices)
      * - ⚠️  ROUTE AGING: Implements custom aging mechanism
      *       - CONFIG_NWK_ROUTE_EXPIRY_TIME: 300000ms (5 minutes)
+     *       - Not for a relayed route to a sleepy end device: only its own frames refresh it, and they may come hours
+     *         apart. The route record table has no aging; a source route goes on a source route failure (#3.6.4.8.1)
+     *         or when a new route record replaces it (#3.6.4.5.5)
      *       - CONFIG_NWK_ROUTE_STALENESS_TIME: 120000ms (2 minutes)
      *       - These values are implementation-specific, not from spec
      * - ✅ Route failure tracking with blacklisting:
@@ -421,10 +424,11 @@ export class NWKHandler {
      * @param entry Entry to judge
      * @param now Reference time, passed in so a whole table is judged against a single instant
      * @param ignoreStale When true, age is not considered
+     * @param sleepy The destination is a sleepy end device: its relayed source routes do not age out (next hop entries do)
      * @returns Reason string for logging, or undefined when the entry is usable
      */
-    #rejectRouteEntry(entry: SourceRouteTableEntry, now: number, ignoreStale: boolean): string | undefined {
-        if (!ignoreStale) {
+    #rejectRouteEntry(entry: SourceRouteTableEntry, now: number, ignoreStale: boolean, sleepy: boolean): string | undefined {
+        if (!ignoreStale && !(sleepy && entry.relayAddresses.length > 0 && !entry.nextHopOnly)) {
             const age = now - entry.lastUpdated;
 
             // remove expired routes
@@ -523,14 +527,16 @@ export class NWKHandler {
      * `Mgmt_Rtg_rsp`, so the selected entry has to be identified rather than sorted to the front.
      *
      * @param entries Entries for one destination
+     * @param destination16 That destination
      * @returns The entry that would carry a frame now, or undefined if none can
      */
-    #selectRouteEntry(entries: SourceRouteTableEntry[]): SourceRouteTableEntry | undefined {
+    #selectRouteEntry(entries: SourceRouteTableEntry[], destination16: number): SourceRouteTableEntry | undefined {
         const now = Date.now();
         const usableEntries: SourceRouteTableEntry[] = [];
+        const sleepy = this.#isSleepyEndDevice(destination16, undefined);
 
         for (const entry of entries) {
-            if (this.#rejectRouteEntry(entry, now, false) === undefined) {
+            if (this.#rejectRouteEntry(entry, now, false, sleepy) === undefined) {
                 usableEntries.push(entry);
             }
         }
@@ -585,10 +591,11 @@ export class NWKHandler {
 
         const now = Date.now();
         const validEntries: SourceRouteTableEntry[] = [];
+        const sleepy = this.#isSleepyEndDevice(destination16, destination64);
 
         // filter out expired and blacklisted routes
         for (const entry of sourceRouteEntries) {
-            const rejection = this.#rejectRouteEntry(entry, now, ignoreStale);
+            const rejection = this.#rejectRouteEntry(entry, now, ignoreStale, sleepy);
 
             if (rejection !== undefined) {
                 logger.debug(() => `Route to ${destination16}:${destination64} ${rejection}`, NS);
@@ -655,7 +662,7 @@ export class NWKHandler {
         // no selectable entry means the frame went direct as a last resort, and a success then says
         // nothing about any stored path: crediting one would clear the blacklist on an entry that
         // carried nothing.
-        const entry = entries === undefined ? undefined : this.#selectRouteEntry(entries);
+        const entry = entries === undefined ? undefined : this.#selectRouteEntry(entries, destination16);
 
         if (entry !== undefined) {
             entry.lastUsed = Date.now();
@@ -685,7 +692,7 @@ export class NWKHandler {
             // mark the currently-selected best route, which is not necessarily the first one held.
             // unlike the success path this keeps a fallback: an explicit repair request has to be
             // able to purge and re-discover even when nothing in the table is selectable.
-            const entry = this.#selectRouteEntry(entries) ?? entries[0];
+            const entry = this.#selectRouteEntry(entries, destination16) ?? entries[0];
             entry.failureCount += 1;
 
             logger.debug(() => `Route to ${destination16} failed (failureCount=${entry.failureCount})`, NS);
@@ -715,6 +722,17 @@ export class NWKHandler {
                 setImmediate(this.sendPeriodicManyToOneRouteRequest.bind(this));
             }
         }
+    }
+
+    /**
+     * Whether a device is an end device (RFD) that keeps its receiver off when idle, from the capabilities it joined or
+     * announced with. Unknown capabilities count as not sleepy.
+     */
+    #isSleepyEndDevice(address16: number, address64: bigint | undefined): boolean {
+        const device64 = address64 ?? this.#context.address16ToAddress64.get(address16);
+        const capabilities = device64 === undefined ? undefined : this.#context.deviceTable.get(device64)?.capabilities;
+
+        return capabilities !== undefined && capabilities.deviceType === 0 && !capabilities.rxOnWhenIdle;
     }
 
     /**
@@ -1718,7 +1736,14 @@ export class NWKHandler {
                 : nwkHeader.source16;
 
         if (source16 !== undefined) {
-            this.upsertSourceRoute(source16, this.createSourceRouteEntry(relays, relayCount + 1));
+            const entry = this.createSourceRouteEntry(relays, relayCount + 1);
+
+            // a sleepy end device's routes do not age out, so its newest record replaces them (#3.6.4.5.5)
+            if (this.#isSleepyEndDevice(source16, nwkHeader.source64)) {
+                this.#context.sourceRouteTable.set(source16, [entry]);
+            } else {
+                this.upsertSourceRoute(source16, entry);
+            }
         }
 
         return offset;

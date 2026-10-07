@@ -485,9 +485,11 @@ describe("NWK Handler", () => {
             expect(requestSpy).toHaveBeenCalledWith(0, child16);
         });
 
-        it("asks again when every route to it has expired", () => {
+        it("asks again when the route a reply gave it has expired", () => {
             addChild(false);
+            // a sleepy end device's own relayed source routes do not age out; a next hop from a route reply does
             const expired = nwkHandler.createSourceRouteEntry([parent16], 2);
+            expired.nextHopOnly = true;
             expired.lastUpdated = Date.now() - 310000;
             mockContext.sourceRouteTable.set(child16, [expired]);
 

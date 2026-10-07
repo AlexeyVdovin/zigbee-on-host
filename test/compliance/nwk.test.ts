@@ -804,6 +804,143 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
             expect(context.sourceRouteTable.has(distant16)).toStrictEqual(false);
             expect(sendMTORR).toHaveBeenCalled();
         });
+
+        describe("routes to a sleepy end device", () => {
+            const sleepy16 = 0x99ab;
+            const sleepy64 = 0x00124b00aabbccdfn;
+
+            function addEndDevice(rxOnWhenIdle: boolean): void {
+                context.deviceTable.set(sleepy64, {
+                    address16: sleepy16,
+                    capabilities: {
+                        alternatePANCoordinator: false,
+                        deviceType: 0,
+                        powerSource: 0,
+                        rxOnWhenIdle,
+                        securityCapability: true,
+                        allocateAddress: true,
+                    },
+                    authorized: true,
+                    neighbor: false,
+                    lastTransportedNetworkKeySeq: undefined,
+                    recentLQAs: [],
+                    incomingNWKFrameCounter: undefined,
+                    endDeviceTimeout: undefined,
+                    linkStatusMisses: 0,
+                });
+                context.address16ToAddress64.set(sleepy16, sleepy64);
+            }
+
+            function routeRecord(relays: number[]): Promise<void> {
+                const { macHeader, nwkHeader } = makeRouteRecordHeaders();
+                macHeader.source16 = relays[relays.length - 1];
+                nwkHeader.source16 = sleepy16;
+
+                return nwkHandler.processCommand(makeRouteRecordCommand(relays), macHeader, nwkHeader);
+            }
+
+            it("keeps a relayed route past the route expiry", async () => {
+                vi.useFakeTimers();
+                addEndDevice(false);
+                const sendMTORR = vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                const old = nwkHandler.createSourceRouteEntry([0x2222, 0x3333], 3);
+                old.lastUpdated = Date.now() - 3_600_000;
+                context.sourceRouteTable.set(sleepy16, [old]);
+
+                const macFrame = await captureMacFrame(
+                    () =>
+                        apsHandler.sendData(
+                            Buffer.from([0xac]),
+                            ZigbeeNWKRouteDiscovery.SUPPRESS,
+                            sleepy16,
+                            sleepy64,
+                            ZigbeeAPSDeliveryMode.UNICAST,
+                            0x0104,
+                            0x0104,
+                            1,
+                            1,
+                            undefined,
+                        ),
+                    mockMACHandlerCallbacks,
+                );
+                vi.runAllTimers();
+                const { nwkFrameControl, nwkHeader } = decodeNWKFromMacFrame(macFrame, true);
+
+                expect(nwkFrameControl.sourceRoute).toStrictEqual(true);
+                expect(nwkHeader.relayAddresses).toStrictEqual([0x2222, 0x3333]);
+                expect(macFrame.header.destination16).toStrictEqual(0x3333);
+                expect(sendMTORR).not.toHaveBeenCalled();
+            });
+
+            it("still expires the route of an end device whose receiver is on", () => {
+                vi.useFakeTimers();
+                addEndDevice(true);
+                vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                const old = nwkHandler.createSourceRouteEntry([0x2222, 0x3333], 3);
+                old.lastUpdated = Date.now() - 310000;
+                context.sourceRouteTable.set(sleepy16, [old]);
+
+                expect(nwkHandler.findBestSourceRoute(sleepy16, sleepy64)).toStrictEqual([undefined, undefined, undefined]);
+                expect(context.sourceRouteTable.has(sleepy16)).toStrictEqual(false);
+            });
+
+            it("still expires a next hop entry learned from a route reply", () => {
+                vi.useFakeTimers();
+                addEndDevice(false);
+                vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                const old = nwkHandler.createSourceRouteEntry([0x3333], 6);
+                old.nextHopOnly = true;
+                old.lastUpdated = Date.now() - 310000;
+                context.sourceRouteTable.set(sleepy16, [old]);
+
+                expect(nwkHandler.findBestSourceRoute(sleepy16, sleepy64)).toStrictEqual([undefined, undefined, undefined]);
+                expect(context.sourceRouteTable.has(sleepy16)).toStrictEqual(false);
+            });
+
+            it("drops a kept route on a source route failure", async () => {
+                vi.useFakeTimers();
+                addEndDevice(false);
+                vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                const old = nwkHandler.createSourceRouteEntry([0x2222, 0x3333], 3);
+                old.lastUpdated = Date.now() - 3_600_000;
+                context.sourceRouteTable.set(sleepy16, [old]);
+                const { macHeader, nwkHeader } = makeRouteRecordHeaders();
+                macHeader.source16 = 0x3333;
+                nwkHeader.source16 = 0x3333;
+
+                await nwkHandler.processStatus(
+                    Buffer.from([ZigbeeNWKStatus.SOURCE_ROUTE_FAILURE, sleepy16 & 0xff, sleepy16 >> 8]),
+                    0,
+                    macHeader,
+                    nwkHeader,
+                );
+                vi.runAllTimers();
+
+                expect(context.sourceRouteTable.has(sleepy16)).toStrictEqual(false);
+            });
+
+            it("replaces older paths with the newest route record", async () => {
+                addEndDevice(false);
+
+                await routeRecord([0x2222, 0x3333]);
+                await routeRecord([0x4444]);
+
+                const entries = context.sourceRouteTable.get(sleepy16);
+
+                expect(entries).toHaveLength(1);
+                expect(entries?.[0]?.relayAddresses).toStrictEqual([0x4444]);
+            });
+
+            it("adds a router's route record beside its other paths", async () => {
+                registerRouter(false);
+                const { macHeader, nwkHeader } = makeRouteRecordHeaders();
+
+                await nwkHandler.processCommand(makeRouteRecordCommand([0x2222, 0x3333]), macHeader, nwkHeader);
+                await nwkHandler.processCommand(makeRouteRecordCommand([0x4444]), macHeader, nwkHeader);
+
+                expect(context.sourceRouteTable.get(routerShortAddress)).toHaveLength(2);
+            });
+        });
     });
 
     /**
