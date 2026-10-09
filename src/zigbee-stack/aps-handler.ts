@@ -411,7 +411,8 @@ export class APSHandler {
                 deliveryMode: apsDeliveryMode,
                 ackFormat: false,
                 security: false, // TODO link key support
-                ackRequest: true,
+                // 05-3474-23 #2.2.5.1.1.5: SHALL be 0 for all frames that are broadcast or multicast
+                ackRequest: nwkDest16 < ZigbeeConsts.BCAST_MIN,
                 extendedHeader: isFragment,
             },
             destEndpoint,
