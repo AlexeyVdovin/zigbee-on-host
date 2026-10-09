@@ -576,13 +576,14 @@ describe("Integration and End-to-End Compliance", () => {
                     undefined,
                 );
 
-                expect(frames).toHaveLength(1);
+                // held pending route discovery: not sent direct to a device that is not a neighbor (#3.6.4.3)
+                expect(frames).toHaveLength(0);
 
                 await vi.runOnlyPendingTimersAsync();
 
-                expect(frames.length).toBeGreaterThanOrEqual(2);
+                expect(frames.length).toBeGreaterThanOrEqual(1);
 
-                const discoveryFrames = frames.slice(1);
+                const discoveryFrames = frames;
                 const decodedDiscovery = discoveryFrames.map((frame) => decodeNwkCommandFromMac(frame, context.netParams.eui64));
                 const routeRequests = decodedDiscovery.filter(({ nwkFrameControl, nwkPayload }) => {
                     if (nwkFrameControl.frameType !== ZigbeeNWKFrameType.CMD) {

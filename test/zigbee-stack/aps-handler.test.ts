@@ -178,12 +178,12 @@ describe("APS Handler", () => {
             const sourceEndpoint = 0x01;
             const destEndpoint = 0x01;
 
-            // Add device to device table
+            // Add device to device table: a neighbor, so a frame without a route goes to it direct
             mockContext.deviceTable.set(destination64, {
                 address16: destination16,
                 capabilities: undefined,
                 authorized: false,
-                neighbor: false,
+                neighbor: true,
                 lastTransportedNetworkKeySeq: undefined,
                 recentLQAs: [],
                 incomingNWKFrameCounter: undefined,
@@ -1619,7 +1619,7 @@ describe("APS Handler", () => {
             address16: 0x7788,
             capabilities: undefined,
             authorized: false,
-            neighbor: false,
+            neighbor: true, // reachable direct without a route
             lastTransportedNetworkKeySeq: undefined,
             recentLQAs: [],
             incomingNWKFrameCounter: undefined,

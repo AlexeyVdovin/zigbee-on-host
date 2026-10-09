@@ -99,6 +99,16 @@ const CONFIG_APS_DUPLICATE_TIMEOUT_MS = 8000; // TODO: verify
 export const CONFIG_APS_ACK_WAIT_DURATION_MS = 1600 + 500; // some extra for ZoH
 /** apsMaxFrameRetries: Default number of APS retransmissions when ACK is missing. */
 export const CONFIG_APS_MAX_FRAME_RETRIES = 3;
+
+/**
+ * A unicast DATA frame to a device that is not a neighbor, with no route to it yet. `findBestSourceRoute` has
+ * requested discovery; the frame is held for it instead of being sent direct (05-3474-23 #3.6.4.3).
+ */
+class APSNoRouteError extends Error {
+    constructor(public readonly dest16: number) {
+        super(`No route to ${dest16}, held pending route discovery`);
+    }
+}
 /** apsFragmentationTimeout: Timeout for incomplete incoming APS fragment reassembly (milliseconds). */
 const CONFIG_APS_FRAGMENT_REASSEMBLY_TIMEOUT_MS = 30000; // TODO: verify
 
@@ -332,7 +342,20 @@ export class APSHandler {
             return await this.#sendFragmentedData(params, apsCounter);
         }
 
-        const sendDest16 = await this.#sendDataInternal(params, apsCounter, 0);
+        let sendDest16: number | undefined;
+
+        try {
+            sendDest16 = await this.#sendDataInternal(params, apsCounter, 0);
+        } catch (error) {
+            if (!(error instanceof APSNoRouteError)) {
+                throw error;
+            }
+
+            // held: the ACK wait runs as if it had been sent, and its retry sends it by the route discovery brings
+            logger.debug(() => `===> APS DATA[apsCounter=${apsCounter} dest16=${error.dest16}] ${error.message}`, NS);
+
+            sendDest16 = error.dest16;
+        }
 
         if (sendDest16 !== undefined) {
             this.#trackPendingAck(sendDest16, apsCounter, params);
@@ -367,9 +390,10 @@ export class APSHandler {
         const macSeqNum = this.#macHandler.nextSeqNum();
         let relayIndex: number | undefined;
         let relayAddresses: number[] | undefined;
+        let pathCost: number | undefined;
 
         try {
-            [relayIndex, relayAddresses] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
+            [relayIndex, relayAddresses, pathCost] = this.#nwkHandler.findBestSourceRoute(nwkDest16, nwkDest64);
         } catch (error) {
             logger.error(
                 `=x=> APS DATA[seqNum=(${apsCounter}/${nwkSeqNum}/${macSeqNum}) attempt=${attempt} nwkDst=${nwkDest16}:${nwkDest64}] ${(error as Error).message}`,
@@ -395,6 +419,19 @@ export class APSHandler {
         // update params as needed
         params.nwkDest16 = nwkDest16;
         params.nwkDest64 = nwkDest64;
+
+        // No route, and the destination is not a neighbor: the MAC cannot reach it direct, so do not try. The spec
+        // gives a frame without a route two outcomes, buffered pending route discovery or discarded (#3.6.4.3);
+        // sending it to the destination's own address is neither, and its NO_ACK would be counted against the
+        // destination, where no later success can clear it.
+        if (
+            nwkDest16 < ZigbeeConsts.BCAST_MIN &&
+            relayAddresses === undefined &&
+            pathCost === undefined &&
+            this.#context.deviceTable.get(nwkDest64 ?? this.#context.address16ToAddress64.get(nwkDest16)!)?.neighbor === false
+        ) {
+            throw new APSNoRouteError(nwkDest16);
+        }
 
         const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
 
@@ -802,6 +839,20 @@ export class APSHandler {
         try {
             await this.#sendDataInternal(entry.params, entry.apsCounter, entry.retries);
         } catch (error) {
+            if (error instanceof APSNoRouteError) {
+                // still no route: keep holding it, this attempt spent
+                logger.debug(
+                    () => `===> APS DATA[apsCounter=${entry.apsCounter} dest16=${entry.dest16} attempt=${entry.retries}] ${error.message}`,
+                    NS,
+                );
+
+                entry.timer = setTimeout(async () => {
+                    await this.#handleAckTimeout(key);
+                }, CONFIG_APS_ACK_WAIT_DURATION_MS);
+
+                return;
+            }
+
             this.#pendingAcks.delete(key);
             logger.warning(
                 () =>
