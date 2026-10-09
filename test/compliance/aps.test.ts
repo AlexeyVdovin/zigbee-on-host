@@ -200,7 +200,7 @@ describe("Zigbee 3.0 Application Support (APS) Layer Compliance", () => {
             expect(apsHeader.profileId).toStrictEqual(0x0104);
         });
 
-        it("suppresses MAC-level acknowledgments for broadcast data frames while APS ACK flag remains set", async () => {
+        it("requests neither a MAC nor an APS acknowledgment for broadcast data frames", async () => {
             const frame = await captureMacFrame(
                 () =>
                     apsHandler.sendData(
@@ -222,7 +222,7 @@ describe("Zigbee 3.0 Application Support (APS) Layer Compliance", () => {
 
             expect(apsFrameControl.frameType).toStrictEqual(ZigbeeAPSFrameType.DATA);
             expect(apsFrameControl.deliveryMode).toStrictEqual(ZigbeeAPSDeliveryMode.BCAST);
-            expect(apsFrameControl.ackRequest).toStrictEqual(true);
+            expect(apsFrameControl.ackRequest).toStrictEqual(false);
             expect(apsHeader.destEndpoint).toStrictEqual(0x0c);
             expect(nwkHeader.destination16).toStrictEqual(ZigbeeConsts.BCAST_DEFAULT);
             expect(frame.frameControl.ackRequest).toStrictEqual(false);
@@ -249,9 +249,11 @@ describe("Zigbee 3.0 Application Support (APS) Layer Compliance", () => {
             const { apsFrameControl, apsHeader } = decodeAPSFrame(frame);
 
             expect(apsFrameControl.deliveryMode).toStrictEqual(ZigbeeAPSDeliveryMode.GROUP);
+            expect(apsFrameControl.ackRequest).toStrictEqual(false);
             expect(apsHeader.group).toStrictEqual(groupId);
             expect(apsHeader.destEndpoint).toBeUndefined();
             expect(apsHeader.sourceEndpoint).toStrictEqual(0x0d);
+            expect(frame.frameControl.ackRequest).toStrictEqual(false);
         });
 
         it("sets the security bit for APS commands requiring encryption", async () => {

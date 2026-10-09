@@ -2639,7 +2639,7 @@ describe("OT RCP Driver", () => {
                 headerIE: undefined,
                 frameCounter: undefined,
                 keySeqCounter: undefined,
-                fcs: 12353,
+                fcs: 27949,
             });
 
             const [nwkFCF, nwkFCFOutOffset] = decodeZigbeeNWKFrameControl(macPayload, 0);
@@ -2685,7 +2685,7 @@ describe("OT RCP Driver", () => {
                     deliveryMode: ZigbeeAPSDeliveryMode.BCAST,
                     ackFormat: false,
                     security: false,
-                    ackRequest: true,
+                    ackRequest: false,
                     extendedHeader: false,
                 },
                 destEndpoint: ZigbeeConsts.ZDO_ENDPOINT,
@@ -2864,7 +2864,7 @@ describe("OT RCP Driver", () => {
                 headerIE: undefined,
                 frameCounter: undefined,
                 keySeqCounter: undefined,
-                fcs: 46050,
+                fcs: 44201,
             });
 
             const [nwkFCF, nwkFCFOutOffset] = decodeZigbeeNWKFrameControl(macPayload, 0);
@@ -2910,7 +2910,7 @@ describe("OT RCP Driver", () => {
                     deliveryMode: ZigbeeAPSDeliveryMode.GROUP,
                     ackFormat: false,
                     security: false,
-                    ackRequest: true,
+                    ackRequest: false,
                     extendedHeader: false,
                 },
                 destEndpoint: undefined,
@@ -2975,7 +2975,7 @@ describe("OT RCP Driver", () => {
                 headerIE: undefined,
                 frameCounter: undefined,
                 keySeqCounter: undefined,
-                fcs: 3676,
+                fcs: 25389,
             });
 
             const [nwkFCF, nwkFCFOutOffset] = decodeZigbeeNWKFrameControl(macPayload, 0);
@@ -3021,7 +3021,7 @@ describe("OT RCP Driver", () => {
                     deliveryMode: ZigbeeAPSDeliveryMode.BCAST,
                     ackFormat: false,
                     security: false,
-                    ackRequest: true,
+                    ackRequest: false,
                     extendedHeader: false,
                 },
                 destEndpoint,
