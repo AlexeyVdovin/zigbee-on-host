@@ -44,7 +44,7 @@ import {
     ZigbeeNWKRouteDiscovery,
     ZigbeeNWKStatus,
 } from "../../src/zigbee/zigbee-nwk.js";
-import { APSHandler, type APSHandlerCallbacks } from "../../src/zigbee-stack/aps-handler.js";
+import { APSHandler, type APSHandlerCallbacks, CONFIG_APS_ACK_WAIT_DURATION_MS } from "../../src/zigbee-stack/aps-handler.js";
 import { processFrame } from "../../src/zigbee-stack/frame.js";
 import { MACHandler, type MACHandlerCallbacks } from "../../src/zigbee-stack/mac-handler.js";
 import { NWKGPHandler, type NWKGPHandlerCallbacks } from "../../src/zigbee-stack/nwk-gp-handler.js";
@@ -1255,34 +1255,102 @@ describe("Zigbee 3.0 Network Layer (NWK) Compliance", () => {
             expect(outboundNWK.relayAddresses).toBeUndefined();
         });
 
-        it("requests route repair when data is sent without a prior route record", async () => {
+        it("requests route repair when data is sent without a prior route record, and holds the frame for it", async () => {
             vi.useFakeTimers();
             registerRouter(false);
             const sendMTORR = vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+            const frames: Buffer[] = [];
+            mockMACHandlerCallbacks.onSendFrame = vi.fn((payload: Buffer) => {
+                frames.push(Buffer.from(payload));
 
-            const macFrame = await captureMacFrame(
-                () =>
-                    apsHandler.sendData(
-                        Buffer.from([0xbb]),
-                        ZigbeeNWKRouteDiscovery.SUPPRESS,
-                        routerShortAddress,
-                        routerIeeeAddress,
-                        ZigbeeAPSDeliveryMode.UNICAST,
-                        0x0104,
-                        0x0104,
-                        1,
-                        1,
-                        undefined,
-                    ),
-                mockMACHandlerCallbacks,
+                return Promise.resolve();
+            });
+
+            await apsHandler.sendData(
+                Buffer.from([0xbb]),
+                ZigbeeNWKRouteDiscovery.SUPPRESS,
+                routerShortAddress,
+                routerIeeeAddress,
+                ZigbeeAPSDeliveryMode.UNICAST,
+                0x0104,
+                0x0104,
+                1,
+                1,
+                undefined,
             );
 
             await vi.runAllTimersAsync();
 
-            const { nwkFrameControl } = decodeNWKFromMacFrame(macFrame, true);
-
-            expect(nwkFrameControl.sourceRoute).toStrictEqual(false);
+            // held pending route discovery, never sent direct to a device that is not a neighbor (#3.6.4.3);
+            // a route request, if any, is a broadcast
+            expect(frames.filter((frame) => decodeMACFramePayload(frame).header.destination16 !== 0xffff)).toHaveLength(0);
             expect(sendMTORR).toHaveBeenCalled();
+        });
+
+        describe("a data frame with no route to a device that is not a neighbor", () => {
+            const relay16 = 0x4455;
+            let frames: Buffer[];
+            // a route request, if one goes out, is a broadcast: only unicasts carry the data frame
+            const unicasts = () => frames.filter((frame) => decodeMACFramePayload(frame).header.destination16 !== 0xffff);
+
+            const send = async () =>
+                await apsHandler.sendData(
+                    Buffer.from([0xcc]),
+                    ZigbeeNWKRouteDiscovery.SUPPRESS,
+                    routerShortAddress,
+                    routerIeeeAddress,
+                    ZigbeeAPSDeliveryMode.UNICAST,
+                    0x0104,
+                    0x0104,
+                    1,
+                    1,
+                    undefined,
+                );
+
+            beforeEach(() => {
+                vi.useFakeTimers();
+                vi.spyOn(nwkHandler, "sendPeriodicManyToOneRouteRequest").mockResolvedValue();
+                frames = [];
+                mockMACHandlerCallbacks.onSendFrame = vi.fn((payload: Buffer) => {
+                    frames.push(Buffer.from(payload));
+
+                    return Promise.resolve();
+                });
+            });
+
+            it("goes out through the route discovery brings, at the APS retry", async () => {
+                registerRouter(false);
+
+                await send();
+                expect(unicasts()).toHaveLength(0);
+
+                // the discovery the lookup requested comes back with a route through a relay
+                context.sourceRouteTable.set(routerShortAddress, [nwkHandler.createSourceRouteEntry([relay16], 2)]);
+                await vi.advanceTimersByTimeAsync(CONFIG_APS_ACK_WAIT_DURATION_MS);
+
+                expect(unicasts()).toHaveLength(1);
+                expect(decodeMACFramePayload(unicasts()[0]!).header.destination16).toStrictEqual(relay16);
+            });
+
+            it("is never sent direct while no route comes, and is given up after the APS retries", async () => {
+                registerRouter(false);
+                const errorSpy = vi.spyOn(logger, "error");
+
+                await send();
+                await vi.runAllTimersAsync();
+
+                expect(unicasts()).toHaveLength(0);
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Retries exhausted"), expect.anything());
+            });
+
+            it("still goes direct when the device is a neighbor", async () => {
+                registerRouter(true);
+
+                await send();
+
+                expect(unicasts()).toHaveLength(1);
+                expect(decodeMACFramePayload(unicasts()[0]!).header.destination16).toStrictEqual(routerShortAddress);
+            });
         });
 
         it("enforces the minimum interval between many-to-one requests", async () => {
