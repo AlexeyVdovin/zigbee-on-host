@@ -127,10 +127,10 @@ export class APSHandler {
     #counter = 0;
     #zdoSeqNum = 0;
 
-    /** Recently seen frames for duplicate rejection by NWK 16 */
-    readonly #duplicateTable16 = new Map<number, DuplicateEntry>();
-    /** Recently seen frames for duplicate rejection by NWK 64 */
-    readonly #duplicateTable64 = new Map<bigint, DuplicateEntry>();
+    /** Recently seen frames for duplicate rejection, by `${NWK 16}:${APS counter}` */
+    readonly #duplicateTable16 = new Map<string, DuplicateEntry>();
+    /** Recently seen frames for duplicate rejection, by `${NWK 64}:${APS counter}` */
+    readonly #duplicateTable64 = new Map<string, DuplicateEntry>();
     /** Pending acknowledgments waiting for retransmission */
     readonly #pendingAcks = new Map<string, PendingAckEntry>();
     /** Incoming fragment reassembly buffers */
@@ -292,7 +292,8 @@ export class APSHandler {
      * Check whether an incoming APS frame is a duplicate and update the duplicate table accordingly.
      *
      * SPEC COMPLIANCE NOTES:
-     * - ✅ Uses {src64, dstEndpoint, clusterId, apsCounter} tuple per spec to detect duplicates
+     * - ✅ Keeps one entry per {source, apsCounter} (05-3474-23 #2.2.8.4.2), so a late copy that arrives after a newer
+     *       frame from the same source is still rejected
      * - ✅ Applies configurable timeout window (DEFAULT ≈ 8s) after which entries expire
      * - ✅ Tracks fragment block numbers explicitly so out-of-order fragment retransmissions are accepted
      * - ✅ Drops duplicates before generating APS ACKs, matching required ordering
@@ -326,9 +327,11 @@ export class APSHandler {
 
         const isFragmented = apsHeader.fragmentation !== undefined && apsHeader.fragmentation !== ZigbeeAPSFragmentation.NONE;
         // frames are dropped in `processFrame` if neither source available
-        const entry = hasSource16 ? this.#duplicateTable16.get(nwkHeader.source16!) : this.#duplicateTable64.get(nwkHeader.source64!);
+        const table = hasSource16 ? this.#duplicateTable16 : this.#duplicateTable64;
+        const key = `${hasSource16 ? nwkHeader.source16 : nwkHeader.source64}:${apsHeader.counter}`;
+        const entry = table.get(key);
 
-        if (entry !== undefined && entry.counter === apsHeader.counter && entry.expiresAt > now) {
+        if (entry !== undefined && entry.expiresAt > now) {
             if (isFragmented) {
                 const blockNumber = apsHeader.fragBlockNumber ?? 0;
                 let fragments = entry.fragments;
@@ -358,11 +361,7 @@ export class APSHandler {
             newEntry.fragments = new Set([apsHeader.fragBlockNumber ?? 0]);
         }
 
-        if (hasSource16) {
-            this.#duplicateTable16.set(nwkHeader.source16!, newEntry);
-        } else {
-            this.#duplicateTable64.set(nwkHeader.source64!, newEntry);
-        }
+        table.set(key, newEntry);
 
         return false;
     }

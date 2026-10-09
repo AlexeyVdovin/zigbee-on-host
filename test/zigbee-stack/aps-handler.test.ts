@@ -1957,6 +1957,32 @@ describe("APS Handler", () => {
         expect(apsHandler.isDuplicateFrame(nwkHeader, nextHeader, now + 2)).toStrictEqual(false);
     });
 
+    it("rejects a late copy that arrives after a newer frame from the same source", () => {
+        const now = Date.now();
+        const headerWith = (counter: number) =>
+            ({
+                frameControl: {
+                    frameType: ZigbeeAPSFrameType.DATA,
+                    deliveryMode: ZigbeeAPSDeliveryMode.BCAST,
+                    ackFormat: false,
+                    security: false,
+                    ackRequest: false,
+                    extendedHeader: false,
+                },
+                counter,
+            }) as ZigbeeAPSHeader;
+
+        for (const nwkHeader of [{ source16: 0x2020 }, { source64: 0x00124b0000004002n }] as ZigbeeNWKHeader[]) {
+            expect(apsHandler.isDuplicateFrame(nwkHeader, headerWith(5), now)).toStrictEqual(false);
+            expect(apsHandler.isDuplicateFrame(nwkHeader, headerWith(6), now + 100)).toStrictEqual(false);
+            expect(apsHandler.isDuplicateFrame(nwkHeader, headerWith(5), now + 500)).toStrictEqual(true);
+            expect(apsHandler.isDuplicateFrame(nwkHeader, headerWith(7), now + 600)).toStrictEqual(false);
+            expect(apsHandler.isDuplicateFrame(nwkHeader, headerWith(6), now + 700)).toStrictEqual(true);
+            // each entry still expires on its own
+            expect(apsHandler.isDuplicateFrame(nwkHeader, headerWith(5), now + 9000)).toStrictEqual(false);
+        }
+    });
+
     it("uses IEEE source table when short address is unknown", () => {
         const start = Date.now();
         const source64 = 0x00124b0000004001n;
