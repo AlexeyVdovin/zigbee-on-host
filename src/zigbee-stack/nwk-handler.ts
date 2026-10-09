@@ -1954,6 +1954,7 @@ export class NWKHandler {
      *       - For other links: creates route through that address ✅
      * - ✅ Updates existing routes if already present (by matching relay list)
      * - ✅ Resets failureCount on route update (fresh link status = healthy link)
+     * - ✅ Clears the sender's MAC NO_ACK count when it reports hearing the coordinator (#3.4.8.3.2, #3.6.4.4.2)
      * - ⚠️ SPEC QUESTION: Using link status to build source routes
      *       - Spec #3.4.8 describes link status for neighbor table maintenance
      *       - Using it to build source routes is an implementation optimization
@@ -2022,6 +2023,16 @@ export class NWKHandler {
                 if (address === ZigbeeConsts.COORDINATOR_ADDRESS) {
                     // if neighbor is coordinator, update device table
                     device.neighbor = true;
+
+                    // The incoming cost is the sender's own estimate of its link from us (#3.4.8.3.2), so a
+                    // non-zero one says it hears the coordinator now. Its NO_ACKs are history then: forget
+                    // them, as a successful unicast to it would. Otherwise a single NO_ACK (a reboot, a
+                    // moment of interference) keeps every route through it rejected, and since nothing is
+                    // then sent through it, nothing ever clears the count. The spec judges a router
+                    // neighbour alive by its link status in the same way (#3.6.4.4.2).
+                    if ((costByte & ZigbeeNWKConsts.CMD_LINK_INCOMING_COST_MASK) !== 0) {
+                        this.#context.macNoACKs.delete(device.address16);
+                    }
                 }
 
                 // use the incoming cost as the path cost (represents link quality from the neighbor's perspective)

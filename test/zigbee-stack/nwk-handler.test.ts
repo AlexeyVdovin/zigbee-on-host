@@ -1196,6 +1196,100 @@ describe("NWK Handler", () => {
             expect(refreshed?.failureCount).toStrictEqual(0);
             expect(mockContext.deviceTable.get(device64)?.neighbor).toStrictEqual(true);
         });
+
+        describe("a neighbour's MAC NO_ACKs", () => {
+            const relay16 = 0x5566;
+            const relay64 = 0x00124b0055667788n;
+            const far16 = 0x7788;
+            const far64 = 0x00124b0077889900n;
+
+            const router = (address16: number) => ({
+                address16,
+                authorized: true,
+                capabilities: {
+                    alternatePANCoordinator: false,
+                    deviceType: 1,
+                    powerSource: 1,
+                    rxOnWhenIdle: true,
+                    securityCapability: true,
+                    allocateAddress: true,
+                },
+                neighbor: true,
+                lastTransportedNetworkKeySeq: undefined,
+                recentLQAs: [],
+                incomingNWKFrameCounter: undefined,
+                endDeviceTimeout: undefined,
+                linkStatusMisses: 0,
+            });
+
+            const linkStatusFrom = (entries: [number, number][]) => {
+                const payload = Buffer.alloc(1 + entries.length * 3);
+                payload.writeUInt8(0x60 | entries.length, 0); // first and last frame
+                entries.forEach(([address, costByte], i) => {
+                    payload.writeUInt16LE(address, 1 + i * 3);
+                    payload.writeUInt8(costByte, 3 + i * 3);
+                });
+
+                nwkHandler.processLinkStatus(
+                    payload,
+                    0,
+                    { frameControl: {}, source16: relay16, sequenceNumber: 1 } as MACHeader,
+                    {
+                        frameControl: {
+                            frameType: 1,
+                            protocolVersion: 2,
+                            discoverRoute: 0,
+                            multicast: false,
+                            security: false,
+                            sourceRoute: false,
+                            extendedDestination: false,
+                            extendedSource: false,
+                            endDeviceInitiator: false,
+                        },
+                        destination16: ZigbeeConsts.BCAST_RX_ON_WHEN_IDLE,
+                        source16: relay16,
+                        source64: undefined,
+                        radius: 1,
+                        seqNum: 9,
+                    } as ZigbeeNWKHeader,
+                );
+            };
+
+            beforeEach(() => {
+                mockContext.address16ToAddress64.set(relay16, relay64);
+                mockContext.deviceTable.set(relay64, router(relay16));
+                mockContext.address16ToAddress64.set(far16, far64);
+                mockContext.deviceTable.set(far64, { ...router(far16), neighbor: false });
+                mockContext.sourceRouteTable.set(far16, [nwkHandler.createSourceRouteEntry([relay16], 2)]);
+                mockContext.macNoACKs.set(relay16, 2);
+            });
+
+            it("are forgotten when its link status says it hears the coordinator, so routes through it work again", () => {
+                // the NO_ACKs reject the only route through it, and the lookup purges it
+                expect(nwkHandler.findBestSourceRoute(far16, undefined)[1]).toBeUndefined();
+                // a route reply brings the same path back, and it is rejected again
+                mockContext.sourceRouteTable.set(far16, [nwkHandler.createSourceRouteEntry([relay16], 2)]);
+                expect(nwkHandler.findBestSourceRoute(far16, undefined)[1]).toBeUndefined();
+
+                mockContext.sourceRouteTable.set(far16, [nwkHandler.createSourceRouteEntry([relay16], 2)]);
+                linkStatusFrom([[ZigbeeConsts.COORDINATOR_ADDRESS, 0x12]]); // incoming 2, outgoing 1
+
+                expect(mockContext.macNoACKs.has(relay16)).toStrictEqual(false);
+                expect(nwkHandler.findBestSourceRoute(far16, undefined)[1]).toStrictEqual([relay16]);
+            });
+
+            it("are kept when it lists the coordinator with no incoming cost", () => {
+                linkStatusFrom([[ZigbeeConsts.COORDINATOR_ADDRESS, 0x30]]); // incoming 0, outgoing 3
+
+                expect(mockContext.macNoACKs.get(relay16)).toStrictEqual(2);
+            });
+
+            it("are kept when its link status does not list the coordinator", () => {
+                linkStatusFrom([[0x9999, 0x11]]);
+
+                expect(mockContext.macNoACKs.get(relay16)).toStrictEqual(2);
+            });
+        });
     });
 
     describe("Link Status Relay Routes", () => {
